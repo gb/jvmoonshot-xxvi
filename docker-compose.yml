@@ -1,0 +1,87 @@
+services:
+  lapada:
+    image: ghcr.io/gb/lapada:latest
+    platform: linux/amd64
+    container_name: rinha-lb
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 10
+      net.ipv4.ip_local_port_range: "15000 64000"
+      net.ipv6.conf.all.disable_ipv6: 1
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "16M"
+
+  api1:
+    image: ghcr.io/gb/jvmoonshot-xxvi:v3
+    platform: linux/amd64
+    container_name: rinha-api1
+    environment:
+      LISTEN_SOCKET: /sockets/api1.sock
+      KDTREE_RELAX_EPSILON: "0.01"
+    volumes:
+      - sockets:/sockets
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv6.conf.all.disable_ipv6: 1
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  api2:
+    image: ghcr.io/gb/jvmoonshot-xxvi:v3
+    platform: linux/amd64
+    container_name: rinha-api2
+    environment:
+      LISTEN_SOCKET: /sockets/api2.sock
+      KDTREE_RELAX_EPSILON: "0.01"
+    volumes:
+      - sockets:/sockets
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv6.conf.all.disable_ipv6: 1
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+networks:
+  default:
+    driver: bridge
