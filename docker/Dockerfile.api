@@ -1,0 +1,80 @@
+# Stages: build (jar + kdtree.bin) -> aot record -> aot create -> runtime.
+
+# JVM_HEAP must be byte-identical in record/create/runtime: the AOT cache is
+# keyed on these flags. UnlockDiagnosticVMOptions is required for
+# GuaranteedSafepointInterval (diagnostic flag).
+ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=32m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-UsePerfData -XX:+DisableExplicitGC"
+
+FROM maven:3.9-eclipse-temurin-25-alpine AS build
+WORKDIR /src
+COPY pom.xml .
+RUN mvn -q -B dependency:go-offline
+COPY src ./src
+RUN mvn -q -B package -DskipTests
+
+# Override REFERENCES_URL with --build-arg to point at a local mirror.
+ARG REFERENCES_URL=https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz
+ADD ${REFERENCES_URL} /tmp/references.json.gz
+RUN java -Xmx4g \
+        --add-modules jdk.incubator.vector \
+        --enable-native-access=ALL-UNNAMED \
+        -cp /src/target/jvmoonshot-xxvi.jar \
+        com.github.gb.moonshot.bench.BuildKdTree \
+        --in /tmp/references.json.gz \
+        --out /tmp/kdtree.bin \
+ && rm /tmp/references.json.gz
+
+# Build payloads.bin: 10k synthetic real-shape request bodies used by
+# WarmupDriver + the live-listener pump. Warming with 10k diverse bodies
+# (instead of the in-class 16-template fallback) exercises more parser/
+# vectorizer/kdtree branches, which keeps cold-cache p99 lower.
+RUN java -Xmx512m \
+        -cp /src/target/jvmoonshot-xxvi.jar \
+        com.github.gb.moonshot.bench.BuildPayloadBank \
+        --out /tmp/payloads.bin --n 10000 --seed 42
+
+# Paths must match the runtime stage: AOT cache records the load codepath.
+RUN mkdir -p /app /data \
+ && cp /src/target/jvmoonshot-xxvi.jar /app/app.jar \
+ && cp /tmp/kdtree.bin /data/kdtree.bin \
+ && cp /tmp/payloads.bin /data/payloads.bin
+
+ARG JVM_HEAP
+ENV JVM_HEAP="${JVM_HEAP}" \
+    PORT=8080 \
+    KDTREE_GRAPH=/data/kdtree.bin
+
+# AOT_TRAINING=1 makes MoonShot.main exit after WarmupDriver so the JVM dumps
+# the aotconf instead of running forever.
+RUN AOT_TRAINING=1 \
+    java $JVM_HEAP -XX:+UseSerialGC \
+        --add-modules jdk.incubator.vector \
+        --enable-native-access=ALL-UNNAMED \
+        -XX:AOTMode=record \
+        -XX:AOTConfiguration=/tmp/app.aotconf \
+        -jar /app/app.jar
+
+RUN java $JVM_HEAP -XX:+UseSerialGC \
+        --add-modules jdk.incubator.vector \
+        --enable-native-access=ALL-UNNAMED \
+        -XX:AOTMode=create \
+        -XX:AOTConfiguration=/tmp/app.aotconf \
+        -XX:AOTCache=/tmp/app.aot \
+        -jar /app/app.jar
+
+# AOT requires JDK, so yeah, not a mistake
+FROM eclipse-temurin:25-jdk-alpine
+WORKDIR /app
+COPY --from=build /app/app.jar       /app/app.jar
+COPY --from=build /data/kdtree.bin   /data/kdtree.bin
+COPY --from=build /data/payloads.bin /data/payloads.bin
+COPY --from=build /tmp/app.aot       /app/app.aot
+
+ENV PORT=8080 \
+    KDTREE_GRAPH=/data/kdtree.bin
+
+EXPOSE 8080
+
+ARG JVM_HEAP
+ENV JVM_HEAP="${JVM_HEAP}"
+ENTRYPOINT ["sh", "-c", "exec java $JVM_HEAP -XX:+UseSerialGC --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:AOTCache=/app/app.aot ${JIT_LOG:+-XX:+LogCompilation -XX:LogFile=/tmp/jit.log} -jar /app/app.jar"]
