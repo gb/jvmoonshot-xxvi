@@ -3,7 +3,7 @@
 # JVM_HEAP must be byte-identical in record/create/runtime: the AOT cache is
 # keyed on these flags. UnlockDiagnosticVMOptions is required for
 # GuaranteedSafepointInterval (diagnostic flag).
-ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=32m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-UsePerfData -XX:+DisableExplicitGC"
+ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=32m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:+UseFMA -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-UsePerfData -XX:+DisableExplicitGC"
 
 FROM maven:3.9-eclipse-temurin-25-alpine AS build
 WORKDIR /src
