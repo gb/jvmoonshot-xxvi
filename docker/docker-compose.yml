@@ -5,9 +5,7 @@
 #   total 1.00 CPU + 350 MB
 services:
   lb:
-    build:
-      context: ../src/main/lapada
-      dockerfile: Dockerfile
+    image: ghcr.io/gb/lapada:v4
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -35,11 +33,7 @@ services:
           memory: "16M"
 
   api1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.api
-      args:
-        REFERENCES_URL: ${REFERENCES_URL:-https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz}
+    image: ghcr.io/gb/jvmoonshot-xxvi:v5
     container_name: ${INSTANCE:-rinha}-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
@@ -58,11 +52,7 @@ services:
           memory: "167M"
 
   api2:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.api
-      args:
-        REFERENCES_URL: ${REFERENCES_URL:-https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz}
+    image: ghcr.io/gb/jvmoonshot-xxvi:v5
     container_name: ${INSTANCE:-rinha}-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
