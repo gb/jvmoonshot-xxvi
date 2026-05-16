@@ -1,6 +1,6 @@
 services:
   lapada:
-    image: ghcr.io/gb/lapada:v3
+    image: ghcr.io/gb/lapada:v4
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -24,16 +24,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.13"
           memory: "16M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v4
+    image: ghcr.io/gb/jvmoonshot-xxvi:v5
     platform: linux/amd64
     container_name: rinha-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
-      KDTREE_RELAX_EPSILON: "0.01"
     volumes:
       - sockets:/sockets
     sysctls:
@@ -48,16 +47,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "165M"
+          cpus: "0.435"
+          memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v4
+    image: ghcr.io/gb/jvmoonshot-xxvi:v5
     platform: linux/amd64
     container_name: rinha-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
-      KDTREE_RELAX_EPSILON: "0.01"
     volumes:
       - sockets:/sockets
     sysctls:
@@ -72,8 +70,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "165M"
+          cpus: "0.435"
+          memory: "167M"
 
 volumes:
   sockets:
