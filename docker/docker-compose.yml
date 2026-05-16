@@ -1,0 +1,88 @@
+# Contest cap: 1.0 CPU + 350 MB total.
+#   lb    0.10 CPU + 16 MB
+#   api1  0.45 CPU + 167 MB
+#   api2  0.45 CPU + 167 MB
+#   total 1.00 CPU + 350 MB
+services:
+  lb:
+    build:
+      context: ../src/main/lapada
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: rinha-lb
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 10
+      net.ipv4.ip_local_port_range: "15000 64000"
+      net.ipv6.conf.all.disable_ipv6: 1
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "16M"
+
+  api1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+      args:
+        REFERENCES_URL: ${REFERENCES_URL:-https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz}
+    container_name: ${INSTANCE:-rinha}-api1
+    environment:
+      LISTEN_SOCKET: /sockets/api1.sock
+      JIT_LOG: ${JIT_LOG:-}
+    volumes:
+      - sockets:/sockets
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv6.conf.all.disable_ipv6: 1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "167M"
+
+  api2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+      args:
+        REFERENCES_URL: ${REFERENCES_URL:-https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz}
+    container_name: ${INSTANCE:-rinha}-api2
+    environment:
+      LISTEN_SOCKET: /sockets/api2.sock
+      JIT_LOG: ${JIT_LOG:-}
+    volumes:
+      - sockets:/sockets
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv6.conf.all.disable_ipv6: 1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "167M"
+
+volumes:
+  sockets:
+
+networks:
+  default:
+    driver: bridge

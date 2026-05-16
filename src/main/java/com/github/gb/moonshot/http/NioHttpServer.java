@@ -1,7 +1,7 @@
 package com.github.gb.moonshot.http;
 
-import com.github.gb.moonshot.instrumentation.StageTimer;
 import com.github.gb.moonshot.codec.ResponseEncoder;
+import com.github.gb.moonshot.instrumentation.StageTimer;
 
 import java.io.IOException;
 import java.net.SocketAddress;
@@ -21,7 +21,7 @@ import java.util.function.Consumer;
 /**
  * Single-thread NIO event loop. Zero-alloc steady-state: each connection owns its read/write buffers and reuses them
  * across pipelined keep-alive requests.
- *
+ * <p>
  * Contest workload: only {@code POST /fraud-score} (and {@code GET /ready} once at boot). Everything else is treated
  * as a malformed peer.
  */
@@ -35,7 +35,9 @@ public final class NioHttpServer {
     // burst overflows writeBuf.
     private static final int MAX_RESPONSE_BYTES = 256;
 
-    /** @return the IO loop thread (used by allocation profilers via {@code ThreadMXBean}). */
+    /**
+     * @return the IO loop thread (used by allocation profilers via {@code ThreadMXBean}).
+     */
     public Thread start(SocketAddress addr, Router router) throws IOException {
         boolean unix = addr instanceof UnixDomainSocketAddress;
         StandardProtocolFamily family = unix ? StandardProtocolFamily.UNIX : StandardProtocolFamily.INET;
@@ -48,9 +50,9 @@ public final class NioHttpServer {
         if (unix) {
             // JDK creates the UDS inode 0755; HAProxy connects as non-root and needs write perm.
             Set<PosixFilePermission> rw666 = EnumSet.of(
-                PosixFilePermission.OWNER_READ,  PosixFilePermission.OWNER_WRITE,
-                PosixFilePermission.GROUP_READ,  PosixFilePermission.GROUP_WRITE,
-                PosixFilePermission.OTHERS_READ, PosixFilePermission.OTHERS_WRITE
+                    PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.GROUP_READ, PosixFilePermission.GROUP_WRITE,
+                    PosixFilePermission.OTHERS_READ, PosixFilePermission.OTHERS_WRITE
             );
             try {
                 Files.setPosixFilePermissions(((UnixDomainSocketAddress) addr).getPath(), rw666);
@@ -112,7 +114,10 @@ public final class NioHttpServer {
             } catch (Throwable t) {
                 t.printStackTrace();
                 if (channel != null) {
-                    try { channel.close(); } catch (IOException ignored) {}
+                    try {
+                        channel.close();
+                    } catch (IOException ignored) {
+                    }
                 }
                 return;
             }
@@ -129,7 +134,10 @@ public final class NioHttpServer {
         }
 
         int bytesRead = channel.read(state.readBuf);
-        if (bytesRead < 0) { close(key); return; }
+        if (bytesRead < 0) {
+            close(key);
+            return;
+        }
         if (bytesRead == 0) return;
 
         if (drainRequests(state, router)) {
@@ -142,7 +150,10 @@ public final class NioHttpServer {
         int cap = Math.min(HttpConnection.READ_BUF_SIZE, state.bytesToDrain);
         state.readBuf.limit(cap);
         int n = channel.read(state.readBuf);
-        if (n < 0) { close(key); return; }
+        if (n < 0) {
+            close(key);
+            return;
+        }
         state.bytesToDrain -= n;
         state.readBuf.clear();
     }
@@ -178,7 +189,7 @@ public final class NioHttpServer {
             }
             if (StageTimer.ENABLED) StageTimer.t0 = System.nanoTime();
             byte[] response = router.route(
-                state.routeId, state.readBuf.array(), state.bodyStart, state.bodyLen);
+                    state.routeId, state.readBuf.array(), state.bodyStart, state.bodyLen);
             if (StageTimer.ENABLED) StageTimer.mark(3, System.nanoTime());
             state.writeBuf.put(response);
             if (StageTimer.ENABLED) {
@@ -220,7 +231,10 @@ public final class NioHttpServer {
     }
 
     private static void close(SelectionKey key) {
-        try { key.channel().close(); } catch (IOException ignored) {}
+        try {
+            key.channel().close();
+        } catch (IOException ignored) {
+        }
         key.cancel();
     }
 }

@@ -1,4 +1,4 @@
-# Stages: build (jar + kdtree.bin) -> aot record -> aot create -> runtime.
+# Stages: build (jar + kdtree-i16.bin) -> aot record -> aot create -> runtime.
 
 # JVM_HEAP must be byte-identical in record/create/runtime: the AOT cache is
 # keyed on these flags. UnlockDiagnosticVMOptions is required for
@@ -21,13 +21,11 @@ RUN java -Xmx4g \
         -cp /src/target/jvmoonshot-xxvi.jar \
         com.github.gb.moonshot.bench.BuildKdTree \
         --in /tmp/references.json.gz \
-        --out /tmp/kdtree.bin \
+        --out /tmp/kdtree-i16.bin \
  && rm /tmp/references.json.gz
 
 # Build payloads.bin: 10k synthetic real-shape request bodies used by
-# WarmupDriver + the live-listener pump. Warming with 10k diverse bodies
-# (instead of the in-class 16-template fallback) exercises more parser/
-# vectorizer/kdtree branches, which keeps cold-cache p99 lower.
+# WarmupDriver + the live-listener pump.
 RUN java -Xmx512m \
         -cp /src/target/jvmoonshot-xxvi.jar \
         com.github.gb.moonshot.bench.BuildPayloadBank \
@@ -36,13 +34,14 @@ RUN java -Xmx512m \
 # Paths must match the runtime stage: AOT cache records the load codepath.
 RUN mkdir -p /app /data \
  && cp /src/target/jvmoonshot-xxvi.jar /app/app.jar \
- && cp /tmp/kdtree.bin /data/kdtree.bin \
+ && cp /tmp/kdtree-i16.bin /data/kdtree-i16.bin \
  && cp /tmp/payloads.bin /data/payloads.bin
 
 ARG JVM_HEAP
 ENV JVM_HEAP="${JVM_HEAP}" \
     PORT=8080 \
-    KDTREE_GRAPH=/data/kdtree.bin
+    INDEX_KIND=kdtree-i16 \
+    KDTREE_GRAPH=/data/kdtree-i16.bin
 
 # AOT_TRAINING=1 makes MoonShot.main exit after WarmupDriver so the JVM dumps
 # the aotconf instead of running forever.
@@ -50,6 +49,8 @@ RUN AOT_TRAINING=1 \
     java $JVM_HEAP -XX:+UseSerialGC \
         --add-modules jdk.incubator.vector \
         --enable-native-access=ALL-UNNAMED \
+        --add-opens java.base/java.io=ALL-UNNAMED \
+        --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
         -XX:AOTMode=record \
         -XX:AOTConfiguration=/tmp/app.aotconf \
         -jar /app/app.jar
@@ -57,6 +58,8 @@ RUN AOT_TRAINING=1 \
 RUN java $JVM_HEAP -XX:+UseSerialGC \
         --add-modules jdk.incubator.vector \
         --enable-native-access=ALL-UNNAMED \
+        --add-opens java.base/java.io=ALL-UNNAMED \
+        --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
         -XX:AOTMode=create \
         -XX:AOTConfiguration=/tmp/app.aotconf \
         -XX:AOTCache=/tmp/app.aot \
@@ -65,16 +68,17 @@ RUN java $JVM_HEAP -XX:+UseSerialGC \
 # AOT requires JDK, so yeah, not a mistake
 FROM eclipse-temurin:25-jdk-alpine
 WORKDIR /app
-COPY --from=build /app/app.jar       /app/app.jar
-COPY --from=build /data/kdtree.bin   /data/kdtree.bin
-COPY --from=build /data/payloads.bin /data/payloads.bin
-COPY --from=build /tmp/app.aot       /app/app.aot
+COPY --from=build /app/app.jar          /app/app.jar
+COPY --from=build /data/kdtree-i16.bin  /data/kdtree-i16.bin
+COPY --from=build /data/payloads.bin    /data/payloads.bin
+COPY --from=build /tmp/app.aot          /app/app.aot
 
 ENV PORT=8080 \
-    KDTREE_GRAPH=/data/kdtree.bin
+    INDEX_KIND=kdtree-i16 \
+    KDTREE_GRAPH=/data/kdtree-i16.bin
 
 EXPOSE 8080
 
 ARG JVM_HEAP
 ENV JVM_HEAP="${JVM_HEAP}"
-ENTRYPOINT ["sh", "-c", "exec java $JVM_HEAP -XX:+UseSerialGC --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:AOTCache=/app/app.aot ${JIT_LOG:+-XX:+LogCompilation -XX:LogFile=/tmp/jit.log} -jar /app/app.jar"]
+ENTRYPOINT ["sh", "-c", "exec java $JVM_HEAP -XX:+UseSerialGC --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED -XX:AOTCache=/app/app.aot ${JIT_LOG:+-XX:+LogCompilation -XX:LogFile=/tmp/jit.log} -jar /app/app.jar"]

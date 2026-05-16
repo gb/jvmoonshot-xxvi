@@ -1,10 +1,6 @@
 package com.github.gb.moonshot.search;
 
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SymbolLookup;
-import java.lang.foreign.ValueLayout;
+import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.nio.MappedByteBuffer;
 
@@ -21,6 +17,7 @@ public final class KdTreeMmap {
 
     private static final MethodHandle MADVISE;
     public static final String MADVISE_DIAG;
+
     static {
         MethodHandle madviseHandle = null;
         String diag;
@@ -32,8 +29,8 @@ public final class KdTreeMmap {
                 diag = "symbol 'madvise' not found in defaultLookup";
             } else {
                 madviseHandle = linker.downcallHandle(symbol.get(),
-                    FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                        ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
                 diag = "ok";
             }
         } catch (Throwable t) {
@@ -43,7 +40,8 @@ public final class KdTreeMmap {
         MADVISE_DIAG = diag;
     }
 
-    private KdTreeMmap() {}
+    private KdTreeMmap() {
+    }
 
     /**
      * madvise an mmap'd MemorySegment. madvise requires page-aligned start; regions start at
@@ -68,7 +66,9 @@ public final class KdTreeMmap {
         }
     }
 
-    /** Touch one byte per 4 KB page across the entire region. Returns a DCE-defeat XOR. */
+    /**
+     * Touch one byte per 4 KB page across the entire region. Returns a DCE-defeat XOR.
+     */
     public static int touchPages(MappedByteBuffer region) {
         int end = region.limit();
         int sink = 0;

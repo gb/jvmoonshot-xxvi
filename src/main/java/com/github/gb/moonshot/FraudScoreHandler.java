@@ -8,36 +8,35 @@ import com.github.gb.moonshot.search.VectorIndex;
 import com.github.gb.moonshot.vector.Vectorizer;
 
 /**
- * Turns a raw HTTP request body into a fraud-neighbor count: parses the JSON payload, vectorizes it, and asks the
- * vector index how many of the {@link #TOP_K} nearest neighbors are flagged as fraud. Returns
- * {@link #FAIL_SAFE_FRAUD_COUNT} on any exception so the request loop never surfaces a 5xx.
+ * {@code body} is sliced by {@code (offset, length)} from the NIO read buffer — nothing is copied between the
+ * wire and the parser.
  *
- * The body is passed as an {@code (offset, length)} slice into the NIO read buffer so nothing is copied between the
- * wire and the parser. The hot path uses zero-alloc {@code parseInto} + {@code vectorizeInto} with reusable scratch
- * buffers.
- *
- * Single-threaded by design the rinha-io NIO loop is the only caller, so the reusable scratch and vector buffers
- * are instance fields, not thread-locals.
+ * <p><b>Thread-safety</b>: {@code scratch} and {@code queryVector} live in a {@link ThreadLocal} so the same
+ * instance can be called from the {@code rinha-io} NIO thread (NioHttpServer) and from ForkJoinPool carrier
+ * threads (FdConnHandler virtual threads) without per-call allocation.
  */
 public final class FraudScoreHandler {
 
     /**
-     * Scoring weights are FP=1, FN=3, Err=5; returning 3 → score 0.6 → DENY costs at most 1 FP, far cheaper than
-     * letting the request surface as 5xx.
+     * Scoring weights are FP=1, FN=3, Err=5;
+     * returning 3 → score 0.6 → DENY costs at most 1 FP, far cheaper than letting the request surface as 5xx.
      */
     private static final int FAIL_SAFE_FRAUD_COUNT = 3;
 
-    /** Off by default under failure load, {@code printStackTrace()} synchronizes on {@code System.err}. */
+    /** {@code printStackTrace()} locks on {@code System.err}; disabled by default to avoid contention under error load. */
     private static final boolean LOG_ERRORS = "1".equals(System.getenv("LOG_ERRORS"));
+
+    private static final class Buffers {
+        final ScoringRequestScratch scratch = new ScoringRequestScratch();
+        /** Lanes 14-15 are stride padding; the vectorizer never writes them, so they stay 0. */
+        final float[] queryVector = new float[Dataset.STRIDE];
+    }
+
+    private static final ThreadLocal<Buffers> BUFFERS_THREAD_LOCAL = ThreadLocal.withInitial(Buffers::new);
 
     private final ScoringRequestParser parser;
     private final Vectorizer vectorizer;
     private final VectorIndex vectorIndex;
-
-    private final ScoringRequestScratch scratch = new ScoringRequestScratch();
-
-    /** Lanes 14-15 are stride padding; the vectorizer never writes them, so they stay 0. */
-    private final float[] queryVector = new float[Dataset.STRIDE];
 
     public FraudScoreHandler(ScoringRequestParser parser, Vectorizer vectorizer, VectorIndex vectorIndex) {
         this.parser = parser;
@@ -47,13 +46,14 @@ public final class FraudScoreHandler {
 
     public int countFraudNeighbors(byte[] body, int offset, int length) {
         try {
-            parser.parseInto(body, offset, length, scratch);
+            Buffers buffers = BUFFERS_THREAD_LOCAL.get();
+            parser.parseInto(body, offset, length, buffers.scratch);
             if (StageTimer.ENABLED) StageTimer.mark(0, System.nanoTime());
 
-            vectorizer.vectorizeInto(body, scratch, queryVector);
+            vectorizer.vectorizeInto(body, buffers.scratch, buffers.queryVector);
             if (StageTimer.ENABLED) StageTimer.mark(1, System.nanoTime());
 
-            int fraudCount = vectorIndex.countFraudsInTop5(queryVector);
+            int fraudCount = vectorIndex.countFraudsInTop5(buffers.queryVector);
             if (StageTimer.ENABLED) {
                 StageTimer.mark(2, System.nanoTime());
                 StageTimer.recordVisits(KdTreeProbes.lastQueryNodesVisited());

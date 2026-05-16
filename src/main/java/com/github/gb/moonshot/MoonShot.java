@@ -1,29 +1,34 @@
 package com.github.gb.moonshot;
 
+import com.github.gb.moonshot.http.FdReceiver;
 import com.github.gb.moonshot.http.NioAotTraining;
 import com.github.gb.moonshot.http.NioHttpServer;
 import com.github.gb.moonshot.http.Router;
 import com.github.gb.moonshot.codec.ScoringRequestParser;
-import com.github.gb.moonshot.search.IvfFlatIndex;
 import com.github.gb.moonshot.search.KdTree;
 import com.github.gb.moonshot.search.KdTreeIO;
 import com.github.gb.moonshot.search.VectorIndex;
 import com.github.gb.moonshot.vector.Vectorizer;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
  * MoonShot: A highly optimized bad idea.
+ * Listen address: {@code LISTEN_SOCKET} (Unix domain) takes priority over {@code PORT} (default 9999).
  *
- * Loads the configured vector index, builds the request pipeline, warms the JIT, and starts the HTTP server.
- * Listen address and index backend are selected via environment variables.
+ * <p>KdTree tuning — epsilon-relaxation, soft cap, BBF depth, prime fan-out — is governed by static
+ * fields on {@link com.github.gb.moonshot.search.KdTreeTuning}, initialized from env vars
+ * ({@code KDTREE_RELAX_EPSILON}, etc.) at class load time.
  *
- * AOT_TRAINING=1 runs the same boot but exits after pumping traffic, so the Leyden recorder can dump its cache.
+ * <p>{@code AOT_TRAINING=1}: runs the same boot but exits after pumping traffic so the Leyden
+ * recorder can dump its cache.
  */
 public final class MoonShot {
 
@@ -33,9 +38,11 @@ public final class MoonShot {
         Vectorizer vectorizer = new Vectorizer();
         Router router = new Router(new FraudScoreHandler(parser, vectorizer, index));
 
-        runWarmup(index, parser, vectorizer, router);
+        new WarmupDriver(index, parser, vectorizer, router).run();
         SocketAddress addr = listenAddress();
         new NioHttpServer().start(addr, router);
+
+        preinitAotClasses();
         runLiveListenerPump(addr);
 
         if (aotTrainingMode()) {
@@ -43,8 +50,29 @@ public final class MoonShot {
             System.exit(0);
         }
 
+        startFdReceiver(router);
         router.markReady();
         log("listening on " + addr);
+    }
+
+    private static void preinitAotClasses() {
+        // Static initializers (SocketChannelImpl + FileDescriptor reflection) must run during
+        // AOT training to appear in the Leyden compilation profile.
+        try {
+            Class.forName("com.github.gb.moonshot.http.FdConnHandler");
+            Class.forName("com.github.gb.moonshot.http.FdReceiver");
+        } catch (ClassNotFoundException | ExceptionInInitializerError ignored) {
+            // Non-fatal on non-Linux: FD passing is Linux-only.
+        }
+    }
+
+    private static void startFdReceiver(Router router) throws IOException {
+        // Starts before markReady so the receiver is listening when lapada gets the ready signal.
+        String fdSocket = env("FD_SOCKET", "");
+        if (!fdSocket.isEmpty()) {
+            new FdReceiver(fdSocket, router).start();
+            log("FD receiver listening on " + fdSocket);
+        }
     }
 
     /**
@@ -56,11 +84,7 @@ public final class MoonShot {
         int connections = Integer.parseInt(env("LIVE_WARMUP_CONNECTIONS", "100"));
         long deadlineNanos = System.nanoTime() + 10_000L * 1_000_000L;
         byte[][] bodies = WarmupDriver.loadBodies();
-        byte[][] frames = new byte[bodies.length][];
-
-        for (int i = 0; i < bodies.length; i++) {
-            frames[i] = WarmupDriver.buildHttpFrame(bodies[i]);
-        }
+        byte[][] frames = Arrays.stream(bodies).map(WarmupDriver::buildHttpFrame).toArray(byte[][]::new);
 
         long t0 = System.nanoTime();
         int done = NioAotTraining.trainLiveListener(addr, frames, iters, deadlineNanos, connections);
@@ -68,91 +92,38 @@ public final class MoonShot {
     }
 
     private static SocketAddress listenAddress() throws Exception {
-        String socketPath = System.getenv("LISTEN_SOCKET");
-        if (socketPath != null && !socketPath.isEmpty()) {
+        String socketPath = env("LISTEN_SOCKET", "");
+        if (!socketPath.isEmpty()) {
             Path path = Path.of(socketPath);
-            // Stale socket from a prior run blocks bind() with AddressInUse; container restart re-uses the volume.
             Files.deleteIfExists(path);
             return UnixDomainSocketAddress.of(path);
         }
-
         int port = Integer.parseInt(env("PORT", "9999"));
         return new InetSocketAddress(port);
     }
 
     private static VectorIndex loadIndex() throws Exception {
-        String kind = env("INDEX_KIND", "kdtree");
+        String kind = env("INDEX_KIND", "kdtree-i16");
         return switch (kind) {
-            case "kdtree" -> loadKdTreeIndex(Path.of(env("KDTREE_GRAPH", "data/kdtree.bin")));
-            case "ivf" -> loadIvfIndex(Path.of(env("IVF_GRAPH", "data/ivf.bin")));
-            default -> throw new IllegalArgumentException("INDEX_KIND must be kdtree|ivf, got: " + kind);
+            case "kdtree-i16" -> loadKdTreeIndex(Path.of(env("KDTREE_GRAPH", "data/kdtree-i16.bin")));
+            default -> throw new IllegalArgumentException("INDEX_KIND must be kdtree-i16, got: " + kind);
         };
     }
 
     private static KdTree loadKdTreeIndex(Path graphPath) throws Exception {
-        log("loading KD-tree from " + graphPath);
-        long loadStarted = System.nanoTime();
-        KdTree index = KdTreeIO.loadMmap(graphPath);
-        log("KD-tree loaded in " + millisSince(loadStarted) + " ms");
-
-        index.applyMmapHints();
-        long prewarmStarted = System.nanoTime();
-        index.prewarm();
-        log("prewarmed mmap pages in " + millisSince(prewarmStarted) + " ms");
-        return index;
-    }
-
-    private static IvfFlatIndex loadIvfIndex(Path graphPath) throws Exception {
-        int nprobe = Integer.parseInt(env("IVF_NPROBE", "16"));
-        log("loading IVF from " + graphPath + " (nprobe=" + nprobe + ")");
-
-        long loadStarted = System.nanoTime();
-        IvfFlatIndex index = IvfFlatIndex.load(graphPath, nprobe);
-        log("IVF loaded in " + millisSince(loadStarted) + " ms "
-            + index.size() + " vectors across " + index.nlist() + " cells");
-
-        return index;
-    }
-
-    private static void runWarmup(VectorIndex index, ScoringRequestParser parser, Vectorizer vectorizer, Router router) {
-        if (index instanceof KdTree kd) {
-            new WarmupDriver(kd, parser, vectorizer, router).run();
-        } else if (index instanceof IvfFlatIndex ivf) {
-            warmIvf(ivf);
-        }
-    }
-
-    /**
-     * IVF's hot path is structurally branch-free (linear cell sweep), so a simple random-vector loop suffices no
-     * need for the input-distribution care that {@link WarmupDriver} takes for KdTree.
-     */
-    private static void warmIvf(IvfFlatIndex index) {
-        log("IVF warmup: 15000 random queries");
-        long deadlineNanos = System.nanoTime() + 30_000L * 1_000_000L;
-        float[] query = new float[com.github.gb.moonshot.Dataset.STRIDE];
-        long state = 0xC0DECAFE12345678L;
-        int sink = 0;
+        log("loading KdTree (mmap pts) from " + graphPath);
         long t0 = System.nanoTime();
-        int iter = 0;
-        while (iter < 15_000 && System.nanoTime() < deadlineNanos) {
-            for (int d = 0; d < com.github.gb.moonshot.Dataset.DIMS; d++) {
-                state = state ^ (state << 13);
-                state = state ^ (state >>> 7);
-                state = state ^ (state << 17);
-                query[d] = (state & 0xFFFF) * (1.0f / 65535.0f);
-            }
-            sink ^= index.countFraudsInTopK(query, 5);
-            iter++;
-        }
-        warmIvfSink = sink; // defeat DCE
-        log("IVF warmup: " + iter + " queries in " + millisSince(t0) + " ms");
+        KdTree index = KdTreeIO.loadMmap(graphPath);
+        log("KdTree loaded in " + millisSince(t0) + " ms, n=" + index.size());
+        index.applyMmapHints();
+        long prewarmStart = System.nanoTime();
+        index.prewarm();
+        log("KdTree prewarmed in " + millisSince(prewarmStart) + " ms");
+        return index;
     }
-
-    @SuppressWarnings("unused")
-    private static volatile int warmIvfSink;
 
     private static boolean aotTrainingMode() {
-        return "1".equals(System.getenv("AOT_TRAINING"));
+        return "1".equals(env("AOT_TRAINING", ""));
     }
 
     private static String env(String key, String fallback) {

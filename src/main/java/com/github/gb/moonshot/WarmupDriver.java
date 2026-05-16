@@ -6,6 +6,7 @@ import com.github.gb.moonshot.http.Router;
 import com.github.gb.moonshot.codec.ScoringRequestParser;
 import com.github.gb.moonshot.codec.ScoringRequestScratch;
 import com.github.gb.moonshot.search.KdTree;
+import com.github.gb.moonshot.search.VectorIndex;
 import com.github.gb.moonshot.vector.Vectorizer;
 
 import java.io.IOException;
@@ -53,12 +54,12 @@ public final class WarmupDriver {
     private static final int  TEMPLATE_COUNT  = 16;
     private static final long SEARCH_RNG_SEED = 0xC0DECAFE12345678L;
 
-    private final KdTree index;
+    private final VectorIndex index;
     private final ScoringRequestParser parser;
     private final Vectorizer vectorizer;
     private final Router router;
 
-    public WarmupDriver(KdTree index, ScoringRequestParser parser, Vectorizer vectorizer, Router router) {
+    public WarmupDriver(VectorIndex index, ScoringRequestParser parser, Vectorizer vectorizer, Router router) {
         this.index = Objects.requireNonNull(index, "index");
         this.parser = Objects.requireNonNull(parser, "parser");
         this.vectorizer = Objects.requireNonNull(vectorizer, "vectorizer");

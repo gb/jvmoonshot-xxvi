@@ -18,22 +18,23 @@ import java.nio.charset.StandardCharsets;
 public final class NioAotTraining {
 
     private static final byte[] WARMUP_RESP =
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] WARMUP_REQ =
-        "GET /ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-            .getBytes(StandardCharsets.US_ASCII);
+            "GET /ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                    .getBytes(StandardCharsets.US_ASCII);
 
     private static final byte[] CONTENT_LENGTH_LC =
-        "content-length:".getBytes(StandardCharsets.US_ASCII);
+            "content-length:".getBytes(StandardCharsets.US_ASCII);
 
-    private NioAotTraining() {}
+    private NioAotTraining() {
+    }
 
     /**
      * Pumps {@code iters} HTTP requests through the bound NIO server via real client sockets, spread across
      * {@code connections} sequential channels. Drives the full accept → select → handleRead → drainRequests →
      * flushWriteBuf chain the server-side hot path that {@link #trainAotHotPath} can't reach (that one bypasses
      * the SocketChannel/Selector layer and calls {@code HttpConnection.tryParse} directly).
-     *
+     * <p>
      * Gets the JDK-internal NIO methods ({@code sun.nio.ch.Util$BufferCache}, {@code SocketChannelImpl},
      * {@code ReentrantLock$NonfairSync}, {@code Unsafe::copyMemory}) past C2's tier-4 threshold so they land in the
      * AOT cache instead of tier-4 compiling under k6 load.
@@ -67,8 +68,8 @@ public final class NioAotTraining {
                 done += connDone;
             } catch (Exception e) {
                 System.err.println("[live-warmup] connection " + c + " failed after "
-                    + done + "/" + iters + " iters: " + e.getClass().getSimpleName()
-                    + ": " + e.getMessage());
+                        + done + "/" + iters + " iters: " + e.getClass().getSimpleName()
+                        + ": " + e.getMessage());
             }
         }
         return done;
@@ -170,7 +171,11 @@ public final class NioAotTraining {
                 return runClientLoop(addr, iters, deadlineNanos);
             } finally {
                 // Bounded join server is a daemon; safe to leak if echo blocks past 500 ms.
-                try { server.join(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                try {
+                    server.join(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         } catch (Exception e) {
             e.printStackTrace();

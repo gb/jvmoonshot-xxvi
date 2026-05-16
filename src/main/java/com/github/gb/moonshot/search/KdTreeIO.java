@@ -3,227 +3,219 @@ package com.github.gb.moonshot.search;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.FloatBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
-import static com.github.gb.moonshot.search.KdTree.DIMS;
-import static com.github.gb.moonshot.search.KdTree.STRIDE;
+import static com.github.gb.moonshot.search.KdTree.*;
 
 /**
- * On-disk format read/write for {@link KdTree}. Magic {@value #MAGIC}; bumped on each layout
- * change so an old artifact fails fast at {@link #loadMmap} instead of producing silent
- * garbage. Layout: pts in variance-descending lane order (see {@link KdTree#DIM_PERMUTATION}),
- * native little-endian (avoids per-load BSWAP). origId + topBbox follow pts so
- * {@link #loadMmap} can page-cache-back them off-heap.
- *
- * <p>Header: 8-byte magic + 4 little-endian ints (n, dims, stride, rootIdx). Bulk regions use
- * 8 MB chunked transfers.
+ * Persist and reload {@link KdTree}. Magic {@value #MAGIC}; bumped on layout changes.
+ * Layout: short[] pts (n*STRIDE), int[] origId (n), byte[] fraud (n),
+ * int topNodeCount, short[] topBbox (topNodeCount*STRIDE_BBOX), int[] topSlot (n).
+ * All multi-byte values little-endian.
+ * Note: right child index is packed into pts[LANE_RIGHT..LANE_RIGHT+1] (STRIDE=20 layout);
+ * there is no separate right[] section in the file.
  */
 public final class KdTreeIO {
 
-    static final String MAGIC = "RKDTR008";
+    static final String MAGIC = "RKDTS020"; // RKDT + S(short) + 020(stride=20)
 
-    private static final int HEADER_BYTES = 8 + 4 * 4;
-    private static final int IO_CHUNK_BYTES = 8 * 1024 * 1024;
+    private static final int HEADER_BYTES = 8 + 4 * 4; // magic + n, dims, stride, root
+    private static final int IO_CHUNK = 8 * 1024 * 1024;
 
-    private KdTreeIO() {}
+    private KdTreeIO() {
+    }
 
     public static void save(KdTree tree, Path file) throws IOException {
-        try (FileChannel channel = FileChannel.open(file,
-                 StandardOpenOption.CREATE, StandardOpenOption.WRITE,
-                 StandardOpenOption.TRUNCATE_EXISTING)) {
+        try (FileChannel ch = FileChannel.open(file,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
 
-            ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            header.put(MAGIC.getBytes());
-            header.putInt(tree.n);
-            header.putInt(DIMS);
-            header.putInt(STRIDE);
-            header.putInt(0); // root index always 0
-            header.flip();
-            writeFully(channel, header);
+            ByteBuffer hdr = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            hdr.put(MAGIC.getBytes());
+            hdr.putInt(tree.n);
+            hdr.putInt(DIMS);
+            hdr.putInt(STRIDE);
+            hdr.putInt(0); // root always 0
+            hdr.flip();
+            writeFully(ch, hdr);
 
-            writeFloats(channel, tree.pts, tree.n * STRIDE);
-            writeInts(channel, tree.origId, tree.n);
-            writeBytes(channel, tree.fraud);
+            writeShorts(ch, tree.pts, tree.n * STRIDE);
+            writeInts(ch, tree.origId, tree.n);
+            writeBytes(ch, tree.fraud);
 
             ByteBuffer meta = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
             meta.putInt(tree.topNodeCount);
             meta.flip();
-            writeFully(channel, meta);
-            writeFloats(channel, tree.topBbox, tree.topNodeCount * DIMS * 2);
-            writeInts(channel, tree.topSlot, tree.n);
+            writeFully(ch, meta);
+
+            writeShorts(ch, tree.topBbox, tree.topNodeCount * STRIDE_BBOX);
+            writeInts(ch, tree.topSlot, tree.n);
         }
     }
 
     public static KdTree load(Path file) throws IOException {
-        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
-            int nodeCount = readAndCheckHeader(channel);
+        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
+            int n = readAndCheckHeader(ch);
 
-            float[] pts = new float[nodeCount * STRIDE];
-            readFloats(channel, pts, nodeCount * STRIDE);
-            int[] origId = new int[nodeCount];
-            readInts(channel, origId, nodeCount);
-            byte[] fraud = new byte[nodeCount];
-            readBytes(channel, fraud);
+            short[] pts = new short[n * STRIDE];
+            readShorts(ch, pts, n * STRIDE);
+            int[] origId = new int[n];
+            readInts(ch, origId, n);
+            byte[] fraud = new byte[n];
+            readBytes(ch, fraud);
 
             ByteBuffer meta = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
-            readFully(channel, meta);
+            readFully(ch, meta);
             meta.flip();
             int topNodeCount = meta.getInt();
-            float[] topBbox = new float[topNodeCount * DIMS * 2];
-            readFloats(channel, topBbox, topNodeCount * DIMS * 2);
-            int[] topSlot = new int[nodeCount];
-            readInts(channel, topSlot, nodeCount);
 
-            return new KdTree(nodeCount, pts, null, null, origId, null, fraud, topSlot, topBbox, null, topNodeCount);
+            short[] topBbox = new short[topNodeCount * STRIDE_BBOX];
+            readShorts(ch, topBbox, topNodeCount * STRIDE_BBOX);
+            int[] topSlot = new int[n];
+            readInts(ch, topSlot, n);
+
+            return new KdTree(n, pts, origId, fraud, topSlot, topBbox, topNodeCount);
         }
     }
 
     /**
-     * Hybrid mmap loader for the production path. Three regions stay file-backed (page-cache):
-     * pts (includes packed-nav fields at lanes 14-15), origId, and topBbox. The cgroup heap
-     * can't hold any one of them, let alone all three. The small fraud byte[n] stays on heap
-     * because it's read every query and the heap cost is trivial.
+     * Production loader: mmap pts (n*STRIDE*2 bytes) off the JVM heap to stay within -Xmx65m.
+     * origId is skipped (not read in the hot path).  right is packed in pts[LANE_RIGHT..+1].
+     * With STRIDE=20 and no separate right[], heap: fraud+topSlot+topBbox ≈ 29 MB for n=3M
+     * — 36 MB headroom at -Xmx65m.
      */
     public static KdTree loadMmap(Path file) throws IOException {
-        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
-            int nodeCount = readAndCheckHeader(channel);
+        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
+            int n = readAndCheckHeader(ch);
 
-            long ptsOff = channel.position();
-            long ptsLen = (long) nodeCount * STRIDE * 4;
-            MappedByteBuffer ptsBuf = channel.map(FileChannel.MapMode.READ_ONLY, ptsOff, ptsLen);
+            long ptsOff = ch.position();
+            long ptsLen = (long) n * STRIDE * 2L;
+            MappedByteBuffer ptsBuf = ch.map(FileChannel.MapMode.READ_ONLY, ptsOff, ptsLen);
             ptsBuf.order(ByteOrder.LITTLE_ENDIAN);
-            FloatBuffer ptsFloats = ptsBuf.asFloatBuffer();
-            channel.position(ptsOff + ptsLen);
+            ch.position(ptsOff + ptsLen);
 
-            // origId stays mmap'd see field-level rationale.
-            long origIdOff = channel.position();
-            long origIdLen = (long) nodeCount * 4L;
-            MappedByteBuffer origIdBuf = channel.map(FileChannel.MapMode.READ_ONLY, origIdOff, origIdLen);
-            origIdBuf.order(ByteOrder.LITTLE_ENDIAN);
-            channel.position(origIdOff + origIdLen);
-
-            byte[] fraud = new byte[nodeCount];
-            readBytes(channel, fraud);
+            // Skip origId bytes in the file.
+            ch.position(ch.position() + (long) n * 4L);
+            byte[] fraud = new byte[n];
+            readBytes(ch, fraud);
 
             ByteBuffer meta = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
-            readFully(channel, meta);
+            readFully(ch, meta);
             meta.flip();
             int topNodeCount = meta.getInt();
 
-            // Mmap topBbox instead of heap-loading it would OOM the cgroup heap. Page-cache
-            // backing is fine; the contest box has plenty of RAM outside the container budget.
-            long topBboxOff = channel.position();
-            long topBboxLen = (long) topNodeCount * DIMS * 2 * 4;
-            MappedByteBuffer topBboxBuf = channel.map(FileChannel.MapMode.READ_ONLY, topBboxOff, topBboxLen);
-            topBboxBuf.order(ByteOrder.LITTLE_ENDIAN);
-            channel.position(topBboxOff + topBboxLen);
+            short[] topBbox = new short[topNodeCount * STRIDE_BBOX];
+            readShorts(ch, topBbox, topNodeCount * STRIDE_BBOX);
+            int[] topSlot = new int[n];
+            readInts(ch, topSlot, n);
 
-            int[] topSlot = new int[nodeCount];
-            readInts(channel, topSlot, nodeCount);
-
-            return new KdTree(nodeCount, null, ptsBuf, ptsFloats, null, origIdBuf, fraud, topSlot, null, topBboxBuf, topNodeCount);
+            return new KdTree(n, ptsBuf, null, fraud, topSlot, topBbox, topNodeCount);
         }
     }
 
-    private static int readAndCheckHeader(FileChannel channel) throws IOException {
-        ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-        readFully(channel, header);
-        header.flip();
+    private static int readAndCheckHeader(FileChannel ch) throws IOException {
+        ByteBuffer hdr = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        readFully(ch, hdr);
+        hdr.flip();
         byte[] magic = new byte[8];
-        header.get(magic);
-        if (!MAGIC.equals(new String(magic))) throw new IOException("bad magic: " + new String(magic));
-        int nodeCount = header.getInt();
-        int dims = header.getInt();
-        int stride = header.getInt();
-        int rootIdx = header.getInt();
-        if (dims != DIMS || stride != STRIDE || rootIdx != 0) {
-            throw new IOException("unexpected dims/stride/root: " + dims + "/" + stride + "/" + rootIdx);
-        }
-        return nodeCount;
+        hdr.get(magic);
+        String magicStr = new String(magic);
+        if (!MAGIC.equals(magicStr)) throw new IOException("bad magic: " + magicStr);
+        int n = hdr.getInt();
+        int dims = hdr.getInt();
+        int stride = hdr.getInt();
+        int root = hdr.getInt();
+        if (dims != DIMS || stride != STRIDE || root != 0)
+            throw new IOException("unexpected dims/stride/root: " + dims + "/" + stride + "/" + root);
+        return n;
     }
 
-    private static void writeFully(FileChannel channel, ByteBuffer buf) throws IOException {
-        while (buf.hasRemaining()) channel.write(buf);
+    private static void writeFully(FileChannel ch, ByteBuffer buf) throws IOException {
+        while (buf.hasRemaining()) ch.write(buf);
     }
 
-    private static void readFully(FileChannel channel, ByteBuffer buf) throws IOException {
+    private static void readFully(FileChannel ch, ByteBuffer buf) throws IOException {
         while (buf.hasRemaining()) {
-            if (channel.read(buf) < 0) throw new IOException("unexpected EOF");
+            if (ch.read(buf) < 0) throw new IOException("unexpected EOF");
         }
     }
 
-    private static void writeBytes(FileChannel channel, byte[] arr) throws IOException {
+    private static void writeBytes(FileChannel ch, byte[] arr) throws IOException {
         int off = 0;
         while (off < arr.length) {
-            int len = Math.min(IO_CHUNK_BYTES, arr.length - off);
-            writeFully(channel, ByteBuffer.wrap(arr, off, len));
+            int len = Math.min(IO_CHUNK, arr.length - off);
+            writeFully(ch, ByteBuffer.wrap(arr, off, len));
             off += len;
         }
     }
 
-    private static void readBytes(FileChannel channel, byte[] arr) throws IOException {
+    private static void readBytes(FileChannel ch, byte[] arr) throws IOException {
         int off = 0;
         while (off < arr.length) {
-            int len = Math.min(IO_CHUNK_BYTES, arr.length - off);
-            readFully(channel, ByteBuffer.wrap(arr, off, len));
+            int len = Math.min(IO_CHUNK, arr.length - off);
+            readFully(ch, ByteBuffer.wrap(arr, off, len));
             off += len;
         }
     }
 
-    /** Copies {@code len} elements between a typed source/destination and the byte buffer at chunk boundary. */
-    @FunctionalInterface
-    private interface ChunkCopier {
-        void copy(ByteBuffer buf, int srcOrDstOff, int len);
-    }
-
-    private static void writeChunked(FileChannel channel, int total, int bytesPerElement, ChunkCopier intoBuf)
-            throws IOException {
-        int elementsPerChunk = IO_CHUNK_BYTES / bytesPerElement;
-        ByteBuffer buf = ByteBuffer.allocate(elementsPerChunk * bytesPerElement).order(ByteOrder.LITTLE_ENDIAN);
+    private static void writeShorts(FileChannel ch, short[] arr, int total) throws IOException {
+        int elemsPerChunk = IO_CHUNK / 2;
+        ByteBuffer buf = ByteBuffer.allocate(Math.min(total, elemsPerChunk) * 2).order(ByteOrder.LITTLE_ENDIAN);
         int off = 0;
         while (off < total) {
-            int len = Math.min(elementsPerChunk, total - off);
+            int len = Math.min(elemsPerChunk, total - off);
             buf.clear();
-            intoBuf.copy(buf, off, len);
-            buf.position(0).limit(len * bytesPerElement);
-            writeFully(channel, buf);
+            buf.asShortBuffer().put(arr, off, len);
+            buf.limit(len * 2);
+            writeFully(ch, buf);
             off += len;
         }
     }
 
-    private static void readChunked(FileChannel channel, int total, int bytesPerElement, ChunkCopier fromBuf)
-            throws IOException {
-        int elementsPerChunk = IO_CHUNK_BYTES / bytesPerElement;
-        ByteBuffer buf = ByteBuffer.allocate(elementsPerChunk * bytesPerElement).order(ByteOrder.LITTLE_ENDIAN);
+    private static void readShorts(FileChannel ch, short[] arr, int total) throws IOException {
+        int elemsPerChunk = IO_CHUNK / 2;
+        ByteBuffer buf = ByteBuffer.allocate(Math.min(total, elemsPerChunk) * 2).order(ByteOrder.LITTLE_ENDIAN);
         int off = 0;
         while (off < total) {
-            int len = Math.min(elementsPerChunk, total - off);
+            int len = Math.min(elemsPerChunk, total - off);
             buf.clear();
-            buf.limit(len * bytesPerElement);
-            readFully(channel, buf);
+            buf.limit(len * 2);
+            readFully(ch, buf);
             buf.flip();
-            fromBuf.copy(buf, off, len);
+            buf.asShortBuffer().get(arr, off, len);
             off += len;
         }
     }
 
-    private static void writeInts(FileChannel channel, int[] arr, int total) throws IOException {
-        writeChunked(channel, total, 4, (buf, off, len) -> buf.asIntBuffer().put(arr, off, len));
+    private static void writeInts(FileChannel ch, int[] arr, int total) throws IOException {
+        int elemsPerChunk = IO_CHUNK / 4;
+        ByteBuffer buf = ByteBuffer.allocate(Math.min(total, elemsPerChunk) * 4).order(ByteOrder.LITTLE_ENDIAN);
+        int off = 0;
+        while (off < total) {
+            int len = Math.min(elemsPerChunk, total - off);
+            buf.clear();
+            buf.asIntBuffer().put(arr, off, len);
+            buf.limit(len * 4);
+            writeFully(ch, buf);
+            off += len;
+        }
     }
 
-    private static void readInts(FileChannel channel, int[] arr, int total) throws IOException {
-        readChunked(channel, total, 4, (buf, off, len) -> buf.asIntBuffer().get(arr, off, len));
-    }
-
-    private static void writeFloats(FileChannel channel, float[] arr, int total) throws IOException {
-        writeChunked(channel, total, 4, (buf, off, len) -> buf.asFloatBuffer().put(arr, off, len));
-    }
-
-    private static void readFloats(FileChannel channel, float[] arr, int total) throws IOException {
-        readChunked(channel, total, 4, (buf, off, len) -> buf.asFloatBuffer().get(arr, off, len));
+    private static void readInts(FileChannel ch, int[] arr, int total) throws IOException {
+        int elemsPerChunk = IO_CHUNK / 4;
+        ByteBuffer buf = ByteBuffer.allocate(Math.min(total, elemsPerChunk) * 4).order(ByteOrder.LITTLE_ENDIAN);
+        int off = 0;
+        while (off < total) {
+            int len = Math.min(elemsPerChunk, total - off);
+            buf.clear();
+            buf.limit(len * 4);
+            readFully(ch, buf);
+            buf.flip();
+            buf.asIntBuffer().get(arr, off, len);
+            off += len;
+        }
     }
 }

@@ -9,7 +9,7 @@ import java.nio.charset.StandardCharsets;
 /**
  * Per-connection state + single-pass HTTP/1.1 header parser. Recycled across pipelined keep-alive requests on the
  * same socket.
- *
+ * <p>
  * Fields are package-private intentionally: {@link NioHttpServer} reads {@code readBuf.array()}, {@code bodyStart},
  * {@code bodyLen} directly on the per-request hot path so the JIT can inline access without going through accessors.
  * Do not add getters.
@@ -18,7 +18,7 @@ final class HttpConnection {
 
     // Int codes (not enum) so drainRequests's four-arm dispatch stays a tableswitch the JIT can fold cleanly.
     static final int NEED_MORE = 0;
-    static final int READY     = 1;
+    static final int READY = 1;
     static final int MALFORMED = 2;
     static final int TOO_LARGE = 3;
 
@@ -31,10 +31,10 @@ final class HttpConnection {
     // SWAR scan for '\r' (0x0d): JIT intrinsifies byteArrayViewVarHandle::get(long) into a single unaligned MOV on
     // x86-64; the hasValue pattern detects any matching byte across 8 lanes in parallel.
     private static final VarHandle LONG_LE =
-        MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+            MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
     private static final long CR_BROADCAST = 0x0d0d0d0d0d0d0d0dL;
-    private static final long LOW_BITS     = 0x0101010101010101L;
-    private static final long HIGH_BITS    = 0x8080808080808080L;
+    private static final long LOW_BITS = 0x0101010101010101L;
+    private static final long HIGH_BITS = 0x8080808080808080L;
 
     final ByteBuffer readBuf = ByteBuffer.allocate(READ_BUF_SIZE);
     final ByteBuffer writeBuf = ByteBuffer.allocate(WRITE_BUF_SIZE);
@@ -45,7 +45,9 @@ final class HttpConnection {
     boolean closeAfterWrite = false;
     int bytesToDrain = 0;
 
-    boolean isDraining() { return bytesToDrain > 0; }
+    boolean isDraining() {
+        return bytesToDrain > 0;
+    }
 
     int tryParse() {
         if (bodyStart < 0) {
@@ -56,7 +58,7 @@ final class HttpConnection {
             byte method = data[0];
             routeId = method == 'P' ? Router.ROUTE_FRAUD_SCORE
                     : method == 'G' ? Router.ROUTE_READY
-                    :                 Router.ROUTE_NOT_FOUND;
+                    : Router.ROUTE_NOT_FOUND;
 
             int contentLen = 0;
 
@@ -66,7 +68,10 @@ final class HttpConnection {
 
             while (true) {
                 if (i + 1 >= n) return NEED_MORE;
-                if (data[i] == '\r' && data[i + 1] == '\n') { i += 2; break; }
+                if (data[i] == '\r' && data[i + 1] == '\n') {
+                    i += 2;
+                    break;
+                }
 
                 // Gate the 15-byte case-fold compare on a single-byte match so every non-C line rejects after one
                 // byte. Unrolled matcher avoids repeated prefix-array loads.
@@ -153,20 +158,20 @@ final class HttpConnection {
     // fold is idempotent on '-', ':', and lowercase ASCII.
     private static boolean hasContentLengthHeader(byte[] data, int from, int n) {
         return n - from >= CONTENT_LENGTH_LC.length
-            && (data[from     ] | 0x20) == 'c'
-            && (data[from +  1] | 0x20) == 'o'
-            && (data[from +  2] | 0x20) == 'n'
-            && (data[from +  3] | 0x20) == 't'
-            && (data[from +  4] | 0x20) == 'e'
-            && (data[from +  5] | 0x20) == 'n'
-            && (data[from +  6] | 0x20) == 't'
-            &&  data[from +  7]         == '-'
-            && (data[from +  8] | 0x20) == 'l'
-            && (data[from +  9] | 0x20) == 'e'
-            && (data[from + 10] | 0x20) == 'n'
-            && (data[from + 11] | 0x20) == 'g'
-            && (data[from + 12] | 0x20) == 't'
-            && (data[from + 13] | 0x20) == 'h'
-            &&  data[from + 14]         == ':';
+                && (data[from] | 0x20) == 'c'
+                && (data[from + 1] | 0x20) == 'o'
+                && (data[from + 2] | 0x20) == 'n'
+                && (data[from + 3] | 0x20) == 't'
+                && (data[from + 4] | 0x20) == 'e'
+                && (data[from + 5] | 0x20) == 'n'
+                && (data[from + 6] | 0x20) == 't'
+                && data[from + 7] == '-'
+                && (data[from + 8] | 0x20) == 'l'
+                && (data[from + 9] | 0x20) == 'e'
+                && (data[from + 10] | 0x20) == 'n'
+                && (data[from + 11] | 0x20) == 'g'
+                && (data[from + 12] | 0x20) == 't'
+                && (data[from + 13] | 0x20) == 'h'
+                && data[from + 14] == ':';
     }
 }
