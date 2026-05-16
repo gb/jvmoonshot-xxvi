@@ -5,7 +5,7 @@
 #   total 1.00 CPU + 350 MB
 services:
   lb:
-    image: ghcr.io/gb/lapada:v6
+    image: ghcr.io/gb/lapada:v7
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -35,7 +35,7 @@ services:
           memory: "16M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v7
+    image: ghcr.io/gb/jvmoonshot-xxvi:v8
     container_name: ${INSTANCE:-rinha}-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
@@ -59,7 +59,7 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v7
+    image: ghcr.io/gb/jvmoonshot-xxvi:v8
     container_name: ${INSTANCE:-rinha}-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
