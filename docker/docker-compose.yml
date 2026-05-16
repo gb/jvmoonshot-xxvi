@@ -1,7 +1,7 @@
 # Contest cap: 1.0 CPU + 350 MB total.
-#   lb    0.10 CPU + 16 MB
-#   api1  0.45 CPU + 167 MB
-#   api2  0.45 CPU + 167 MB
+#   lb    0.15 CPU + 16 MB
+#   api1  0.425 CPU + 167 MB
+#   api2  0.425 CPU + 167 MB
 #   total 1.00 CPU + 350 MB
 services:
   lb:
@@ -29,7 +29,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.15"
           memory: "16M"
 
   api1:
@@ -48,7 +48,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.425"
           memory: "167M"
 
   api2:
@@ -67,7 +67,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.425"
           memory: "167M"
 
 volumes:
