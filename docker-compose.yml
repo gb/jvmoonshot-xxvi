@@ -30,7 +30,7 @@ services:
           memory: "16M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v9
+    image: ghcr.io/gb/jvmoonshot-xxvi:v10
     platform: linux/amd64
     container_name: rinha-api1
     cpuset: "0,2"
@@ -55,7 +55,7 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v9
+    image: ghcr.io/gb/jvmoonshot-xxvi:v10
     platform: linux/amd64
     container_name: rinha-api2
     cpuset: "1,3"
