@@ -33,7 +33,7 @@ public final class WarmupDriver {
     /** Router dispatch + ResponseEncoder lookup; search/parser already warm from dedicated loops. */
     private static final int ROUTE_ITERS = 200;
 
-    /** Pushes tryParse (362 B), Router.route (56 B), countFraudNeighbors (108 B) past tier 4. */
+    /** Pushes tryParse, Router.fraudScoreResponse, and countFraudNeighborsFast past tier 4. */
     private static final int HTTP_PARSE_ITERS = 20_000;
 
     /** Socket I/O loopback to compile SocketChannel.read/write paths. */
@@ -175,7 +175,7 @@ public final class WarmupDriver {
         int iter = 0;
         while (iter < ROUTE_ITERS && System.nanoTime() < deadlineNanos) {
             byte[] body = bodies[iter % bodies.length];
-            byte[] response = router.route(Router.ROUTE_FRAUD_SCORE, body, 0, body.length);
+            byte[] response = router.fraudScoreResponse(body, 0, body.length);
             sink ^= response[0];
             iter++;
         }

@@ -46,6 +46,11 @@ public final class Router {
         ready = true;
     }
 
+    /** Fast contest path: caller already proved {@code ROUTE_FRAUD_SCORE}, so skip switch + ready volatile read. */
+    public byte[] fraudScoreResponse(byte[] body, int bodyOffset, int bodyLength) {
+        return FRAUD_RESPONSES[fraudHandler.countFraudNeighborsFast(body, bodyOffset, bodyLength)];
+    }
+
     public byte[] route(int routeId, byte[] body, int bodyOffset, int bodyLength) {
         return switch (routeId) {
             case ROUTE_FRAUD_SCORE -> FRAUD_RESPONSES[fraudHandler.countFraudNeighbors(body, bodyOffset, bodyLength)];

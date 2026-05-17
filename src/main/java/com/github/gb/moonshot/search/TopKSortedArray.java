@@ -64,6 +64,21 @@ final class TopKSortedArray {
         return count;
     }
 
+    /**
+     * Mmap-mode fraud count: reads the fraud flag from lane {@link KdTree#LANE_FRAUD} of each
+     * result node's pts block, eliminating the separate on-heap {@code fraud[]} array.
+     * Each read lands in the same 40-byte cache line that was fetched during the search.
+     */
+    int countFraudsFromMmap(long ptsBaseAddr, int stride) {
+        int count = 0;
+        long fraudByteOffset = (long) KdTree.LANE_FRAUD * 2L; // short offset → byte offset
+        for (int i = 0; i < size; i++) {
+            count += KdTreeUnsafe.UNSAFE.getShort(
+                    ptsBaseAddr + (long) ids[i] * ((long) stride * 2L) + fraudByteOffset) & 1;
+        }
+        return count;
+    }
+
     int drainAscending(int[] out) {
         int n = size;
         System.arraycopy(ids, 0, out, 0, n);

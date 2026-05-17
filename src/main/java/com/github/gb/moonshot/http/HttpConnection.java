@@ -37,7 +37,9 @@ final class HttpConnection {
     private static final long HIGH_BITS = 0x8080808080808080L;
 
     final ByteBuffer readBuf = ByteBuffer.allocate(READ_BUF_SIZE);
-    final ByteBuffer writeBuf = ByteBuffer.allocate(WRITE_BUF_SIZE);
+    // Direct write buffer avoids the JDK's per-write heap-to-native staging copy on SocketChannel.write().
+    // Responses are tiny but p99 is hypersensitive to extra memcpy/JNI staging on the single IO thread.
+    final ByteBuffer writeBuf = ByteBuffer.allocateDirect(WRITE_BUF_SIZE);
 
     int routeId = Router.ROUTE_NOT_FOUND;
     int bodyStart = -1;

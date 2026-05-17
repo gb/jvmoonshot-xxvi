@@ -20,7 +20,7 @@ import static com.github.gb.moonshot.search.KdTree.*;
  */
 public final class KdTreeIO {
 
-    static final String MAGIC = "RKDTS020"; // RKDT + S(short) + 020(stride=20)
+    static final String MAGIC = "RKDTS021"; // RKDT + S(short) + 021: fraud packed into pts lane 18
 
     private static final int HEADER_BYTES = 8 + 4 * 4; // magic + n, dims, stride, root
     private static final int IO_CHUNK = 8 * 1024 * 1024;
@@ -83,9 +83,9 @@ public final class KdTreeIO {
 
     /**
      * Production loader: mmap pts (n*STRIDE*2 bytes) off the JVM heap to stay within -Xmx65m.
-     * origId is skipped (not read in the hot path).  right is packed in pts[LANE_RIGHT..+1].
-     * With STRIDE=20 and no separate right[], heap: fraud+topSlot+topBbox ≈ 29 MB for n=3M
-     * — 36 MB headroom at -Xmx65m.
+     * origId and fraud are skipped — fraud flag lives in pts lane {@link KdTree#LANE_FRAUD} (18),
+     * read directly from the mmap in {@link TopKSortedArray#countFraudsFromMmap}.
+     * Heap: topSlot+topBbox ≈ 28 MB for n=3M — 37 MB headroom at -Xmx65m (3 MB freed vs v020).
      */
     public static KdTree loadMmap(Path file) throws IOException {
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
@@ -97,10 +97,10 @@ public final class KdTreeIO {
             ptsBuf.order(ByteOrder.LITTLE_ENDIAN);
             ch.position(ptsOff + ptsLen);
 
-            // Skip origId bytes in the file.
+            // Skip origId (not on hot path).
             ch.position(ch.position() + (long) n * 4L);
-            byte[] fraud = new byte[n];
-            readBytes(ch, fraud);
+            // Skip separate fraud section — fraud is now in pts lane LANE_FRAUD (18).
+            ch.position(ch.position() + (long) n);
 
             ByteBuffer meta = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
             readFully(ch, meta);
@@ -112,7 +112,7 @@ public final class KdTreeIO {
             int[] topSlot = new int[n];
             readInts(ch, topSlot, n);
 
-            return new KdTree(n, ptsBuf, null, fraud, topSlot, topBbox, topNodeCount);
+            return new KdTree(n, ptsBuf, null, null, topSlot, topBbox, topNodeCount);
         }
     }
 

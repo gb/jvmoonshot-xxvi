@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.EnumSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Consumer;
 
 /**
@@ -35,9 +36,14 @@ public final class NioHttpServer {
     // burst overflows writeBuf.
     private static final int MAX_RESPONSE_BYTES = 256;
 
-    /**
-     * @return the IO loop thread (used by allocation profilers via {@code ThreadMXBean}).
-     */
+    /** Error logging is off by default: synchronized stderr writes are catastrophic during short p99 runs. */
+    private static final boolean LOG_IO_ERRORS = "1".equals(System.getenv("LOG_IO_ERRORS"));
+
+    /** FD-passed channels queued by {@link FdReceiver} for registration on the next select() iteration. */
+    private final ConcurrentLinkedQueue<SocketChannel> pendingChannels = new ConcurrentLinkedQueue<>();
+    private volatile Selector selectorRef;
+
+    /** @return the IO loop thread (used by allocation profilers via {@code ThreadMXBean}). */
     public Thread start(SocketAddress addr, Router router) throws IOException {
         boolean unix = addr instanceof UnixDomainSocketAddress;
         StandardProtocolFamily family = unix ? StandardProtocolFamily.UNIX : StandardProtocolFamily.INET;
@@ -63,15 +69,31 @@ public final class NioHttpServer {
         server.configureBlocking(false);
 
         Selector selector = Selector.open();
+        this.selectorRef = selector; // visible to injectChannel() after Thread.start() happens-before
         server.register(selector, SelectionKey.OP_ACCEPT);
 
-        Thread t = new Thread(() -> loop(selector, server, router, !unix), "rinha-io");
+        Thread t = new Thread(() -> loop(selector, server, router, !unix, pendingChannels), "rinha-io");
         t.setDaemon(false);
+        // Best effort only; some container runtimes ignore Java priorities, but when honored this keeps the
+        // selector/response thread ahead of warmup leftovers and JVM housekeeping during the contest window.
+        t.setPriority(Thread.MAX_PRIORITY);
         t.start();
         return t;
     }
 
-    private static void loop(Selector selector, ServerSocketChannel server, Router router, boolean tcpOptions) {
+    /**
+     * Register a non-blocking {@link SocketChannel} received via FD passing into this server's selector.
+     * Thread-safe: can be called from any thread (e.g. {@link FdReceiver}'s recv loop thread).
+     * The channel must already be configured non-blocking by the caller.
+     */
+    public void injectChannel(SocketChannel ch) {
+        pendingChannels.add(ch);
+        Selector sel = selectorRef;
+        if (sel != null) sel.wakeup();
+    }
+
+    private static void loop(Selector selector, ServerSocketChannel server, Router router, boolean tcpOptions,
+                             ConcurrentLinkedQueue<SocketChannel> pending) {
         // Allocated once; select(Consumer) auto-removes keys after callback returns.
         Consumer<SelectionKey> handle = key -> {
             try {
@@ -81,17 +103,28 @@ public final class NioHttpServer {
                 else if (key.isWritable()) handleWrite(key);
             } catch (Throwable t) {
                 // Catch Throwable so a per-key error closes only this key, not the whole loop.
-                t.printStackTrace();
+                logIoError(t);
                 close(key);
             }
         };
         while (!Thread.interrupted()) {
             try {
+                // Drain FD-passed channels before blocking. ConcurrentLinkedQueue.poll() is
+                // wait-free; draining here (on the selector thread) avoids any locking on Selector.
+                SocketChannel inj;
+                while ((inj = pending.poll()) != null) {
+                    try {
+                        inj.register(selector, SelectionKey.OP_READ, new HttpConnection());
+                    } catch (Throwable t) {
+                        logIoError(t);
+                        try { inj.close(); } catch (IOException ignored) {}
+                    }
+                }
                 selector.select(handle);
             } catch (Throwable t) {
                 // One bad select() iteration must not terminate the loop; loop-fatal conditions surface via
                 // Thread.interrupted.
-                t.printStackTrace();
+                logIoError(t);
             }
         }
     }
@@ -112,12 +145,9 @@ public final class NioHttpServer {
                 }
                 channel.register(selector, SelectionKey.OP_READ, new HttpConnection());
             } catch (Throwable t) {
-                t.printStackTrace();
+                logIoError(t);
                 if (channel != null) {
-                    try {
-                        channel.close();
-                    } catch (IOException ignored) {
-                    }
+                    try { channel.close(); } catch (IOException ignored) {}
                 }
                 return;
             }
@@ -188,8 +218,9 @@ public final class NioHttpServer {
                 return true;
             }
             if (StageTimer.ENABLED) StageTimer.t0 = System.nanoTime();
-            byte[] response = router.route(
-                    state.routeId, state.readBuf.array(), state.bodyStart, state.bodyLen);
+            byte[] response = state.routeId == Router.ROUTE_FRAUD_SCORE
+                    ? router.fraudScoreResponse(state.readBuf.array(), state.bodyStart, state.bodyLen)
+                    : router.route(state.routeId, state.readBuf.array(), state.bodyStart, state.bodyLen);
             if (StageTimer.ENABLED) StageTimer.mark(3, System.nanoTime());
             state.writeBuf.put(response);
             if (StageTimer.ENABLED) {
@@ -228,6 +259,10 @@ public final class NioHttpServer {
             return;
         }
         key.interestOps(SelectionKey.OP_READ);
+    }
+
+    private static void logIoError(Throwable t) {
+        if (LOG_IO_ERRORS) t.printStackTrace();
     }
 
     private static void close(SelectionKey key) {

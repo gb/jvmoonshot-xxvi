@@ -140,7 +140,11 @@ public final class KdTreeBuilder {
         // Copy quantized feature dims (NOT nav slots — those come after left/right build).
         System.arraycopy(srcVecsShort, srcId * STRIDE, pts, treeIdx * STRIDE, DIMS);
         origId[treeIdx] = srcId;
-        fraud[treeIdx] = (byte) (srcFraud[srcId] ? 1 : 0);
+        byte fraudBit = (byte) (srcFraud[srcId] ? 1 : 0);
+        fraud[treeIdx] = fraudBit;
+        // Pack fraud flag into lane LANE_FRAUD (18) of the pts short array (was unused padding).
+        // In mmap mode this eliminates the separate 3 MB on-heap fraud[] array.
+        pts[treeIdx * STRIDE + LANE_FRAUD] = fraudBit;
 
         int leftIdx = buildRecursive(srcVecsFloat, srcVecsShort, srcFraud, indices,
                 from, splitPos, depth + 1, pts, origId, fraud, nextIdx, rng);

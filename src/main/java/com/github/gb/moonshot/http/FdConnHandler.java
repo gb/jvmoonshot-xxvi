@@ -4,46 +4,29 @@ import com.github.gb.moonshot.codec.ResponseEncoder;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
-import java.nio.channels.Channels;
+import java.net.ProtocolFamily;
+import java.net.StandardProtocolFamily;
+import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.channels.spi.SelectorProvider;
 
 /**
- * Blocking HTTP/1.1 keep-alive handler for a connection received via FD passing.
+ * Raw-fd wrapping helper for client TCP sockets received from lapada via
+ * {@code SCM_RIGHTS}. Runtime traffic uses {@link #wrapFd(int)} so
+ * {@link FdReceiver} can inject each socket into {@link NioHttpServer}'s
+ * selector; the blocking {@link #handle(int, Router)} loop is kept only for
+ * AOT training and diagnostics.
  *
- * <p>Takes a raw POSIX file descriptor (a TCP socket passed by lapada via
- * {@code SCM_RIGHTS}), wraps it as a {@link SocketChannel} via reflection on
- * {@code sun.nio.ch.SocketChannelImpl}, and runs a parse→route→respond loop
- * equivalent to {@link NioHttpServer}'s per-connection state machine.
- *
- * <p>SocketChannel (not FileInputStream) is used because the VT spike showed
- * that {@code FileInputStream.read()} on a socket fd pins the carrier thread
- * on macOS Java 25 (and may on other platforms too). SocketChannel.read()
- * is the documented VT-safe I/O path: it registers the fd with the JVM's
- * internal poller (epoll on Linux) and properly unmounts the virtual thread
- * while waiting for data.
- *
- * <p>The {@link #SOCKET_CHANNEL_CTOR} reflection is cached at class load,
- * so the per-connection cost is one constructor invocation and one FileDescriptor
- * field set — negligible at 450 connections/second.
- *
- * <p>Designed to run on a Java 21+ virtual thread: blocking reads unmount the
- * virtual thread without consuming a platform thread.  At 100 concurrent
- * connections the virtual thread overhead is negligible (&lt;10 MB total).
- *
- * <p><b>Known limitation — no read timeout.</b>  {@link SocketChannel} in
- * blocking mode does not expose {@code SO_TIMEOUT}.  A misbehaving client that
- * stalls mid-request parks the virtual thread indefinitely.  Acceptable for
- * the contest workload (k6 VUs always complete).
+ * <p>The {@link #SOCKET_CHANNEL_CTOR} reflection is cached at class load, so
+ * the per-connection runtime cost is one constructor invocation and one
+ * {@link FileDescriptor} field write before selector registration.
  */
 public final class FdConnHandler {
 
     /**
-     * {@code sun.nio.ch.SocketChannelImpl(SelectorProvider, FileDescriptor, InetSocketAddress)}
+     * {@code sun.nio.ch.SocketChannelImpl(SelectorProvider, ProtocolFamily, FileDescriptor, SocketAddress)}
      * — the only public-facing way to wrap a raw socket fd in a SocketChannel without
      * going through the OS accept() path.  Cached once at class load.
      */
@@ -53,8 +36,9 @@ public final class FdConnHandler {
     static {
         try {
             Class<?> implClass = Class.forName("sun.nio.ch.SocketChannelImpl");
+            // JDK 25 changed the signature: added ProtocolFamily, generalized InetSocketAddress→SocketAddress.
             SOCKET_CHANNEL_CTOR = implClass.getDeclaredConstructor(
-                    SelectorProvider.class, FileDescriptor.class, java.net.InetSocketAddress.class);
+                    SelectorProvider.class, ProtocolFamily.class, FileDescriptor.class, java.net.SocketAddress.class);
             SOCKET_CHANNEL_CTOR.setAccessible(true);
 
             FD_FIELD = FileDescriptor.class.getDeclaredField("fd");
@@ -65,44 +49,42 @@ public final class FdConnHandler {
     }
 
     /**
+     * Wrap a raw POSIX TCP socket fd in a {@link SocketChannel}.
+     * The caller is responsible for setting the blocking mode and registering or handling the channel.
+     */
+    static SocketChannel wrapFd(int rawFd) throws Exception {
+        FileDescriptor jfd = new FileDescriptor();
+        FD_FIELD.set(jfd, rawFd);
+        return (SocketChannel) SOCKET_CHANNEL_CTOR.newInstance(
+                SelectorProvider.provider(), StandardProtocolFamily.INET, jfd, null);
+    }
+
+    /**
      * Handle one TCP connection lifetime for a file descriptor received via FD passing.
      * Blocks until the client closes or a parse error is detected.
-     * Designed to be called from a virtual thread.
+     * Designed to be called from a virtual thread (AOT training path only in production;
+     * the NIO selector path is used at runtime).
      *
      * @param rawFd  the raw int fd of the accepted TCP socket
      * @param router the request router (shared, thread-safe because FraudScoreHandler is)
      */
     public static void handle(int rawFd, Router router) {
-        FileDescriptor jfd = new FileDescriptor();
-        try {
-            FD_FIELD.set(jfd, rawFd);
-        } catch (IllegalAccessException e) {
-            return;
-        }
-
         SocketChannel channel;
         try {
-            // Create a SocketChannel wrapping the received fd.  Blocking mode ensures
-            // channel.read() blocks for data (unmounting the VT via the JVM poller)
-            // rather than returning 0 immediately.
-            channel = (SocketChannel) SOCKET_CHANNEL_CTOR.newInstance(
-                    SelectorProvider.provider(), jfd, null);
+            channel = wrapFd(rawFd);
             channel.configureBlocking(true);
         } catch (Exception e) {
             return;
         }
 
-        try (SocketChannel ch = channel;
-             InputStream in = Channels.newInputStream(ch);
-             OutputStream out = Channels.newOutputStream(ch)) {
-            runLoop(in, out, router);
+        try (SocketChannel ch = channel) {
+            runLoop(ch, router);
         } catch (IOException ignored) {
             // Connection closed or reset — normal end of connection.
         }
     }
 
-    private static void runLoop(InputStream in, OutputStream out, Router router)
-            throws IOException {
+    private static void runLoop(SocketChannel channel, Router router) throws IOException {
         HttpConnection state = new HttpConnection();
         byte[] raw = state.readBuf.array();
 
@@ -117,26 +99,29 @@ public final class FdConnHandler {
                     // bodyStart is -1 so enterDrainMode() would set bytesToDrain to a large
                     // negative value and the drain loop would not execute, leaving unread
                     // data in the TCP stream that would corrupt the next request.
-                    out.write(ResponseEncoder.badRequestClose());
+                    writeResponse(channel, state, ResponseEncoder.badRequestClose());
                     return;
                 }
-                int n = in.read(raw, pos, cap - pos);
+                int n = channel.read(state.readBuf);
                 if (n < 0) return; // client closed
-                state.readBuf.position(pos + n);
+                if (n == 0) continue;
 
                 int result = state.tryParse();
                 if (result == HttpConnection.READY) break;
                 if (result == HttpConnection.MALFORMED) {
-                    out.write(ResponseEncoder.badRequestClose());
+                    writeResponse(channel, state, ResponseEncoder.badRequestClose());
                     return; // close
                 }
                 if (result == HttpConnection.TOO_LARGE) {
-                    out.write(ResponseEncoder.payloadTooLargeKeepAlive());
+                    writeResponse(channel, state, ResponseEncoder.payloadTooLargeKeepAlive());
                     state.enterDrainMode();
                     while (state.isDraining()) {
-                        int nd = in.read(raw, 0, Math.min(cap, state.bytesToDrain));
+                        state.readBuf.limit(Math.min(cap, state.bytesToDrain));
+                        int nd = channel.read(state.readBuf);
                         if (nd < 0) return;
+                        if (nd == 0) continue;
                         state.bytesToDrain -= nd;
+                        state.readBuf.clear();
                     }
                     state.readBuf.clear();
                     break; // next request
@@ -147,10 +132,21 @@ public final class FdConnHandler {
             if (state.bodyStart < 0) continue; // came from drain-reset, no request to route
 
             byte[] response = router.route(state.routeId, raw, state.bodyStart, state.bodyLen);
-            // write() copies directly into the kernel TCP send buffer.
-            out.write(response);
+            writeResponse(channel, state, response);
             state.advanceAfterRequest();
         }
+    }
+
+    private static void writeResponse(SocketChannel channel, HttpConnection state, byte[] response)
+            throws IOException {
+        ByteBuffer out = state.writeBuf;
+        out.clear();
+        out.put(response);
+        out.flip();
+        while (out.hasRemaining()) {
+            channel.write(out);
+        }
+        out.clear();
     }
 
     private FdConnHandler() {

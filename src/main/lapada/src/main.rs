@@ -4,8 +4,8 @@
 //!
 //! FD-passing mode (set FD_UPSTREAMS env var):
 //!   Instead of proxying data, lapada accepts the TCP socket then passes the raw FD to the
-//!   chosen API instance via sendmsg SCM_RIGHTS over a control Unix socket.  The API reads
-//!   directly from the client socket, eliminating the HAProxy data-copy path.
+//!   chosen API instance via sendmsg SCM_RIGHTS over a persistent Unix control socket.  The
+//!   API reads directly from the client socket, eliminating the lapada data-copy path.
 //!   BACKENDS (api1.sock/api2.sock) are still used for /ready health probes.
 
 use std::env;
@@ -20,13 +20,15 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream, UnixStream};
 use tokio::time::timeout;
 
 #[cfg(target_os = "linux")]
+use tokio::sync::Mutex as AsyncMutex;
+
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
 const BACKENDS: [&str; 2] = ["/sockets/api1.sock", "/sockets/api2.sock"];
 const LISTEN_BACKLOG: u32 = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const COPY_BUF: usize = 1024;
-const READ_TIMEOUT: Duration = Duration::from_millis(2_050);
 const BACKEND_COOLDOWN_MS: u64 = 1_000;
 const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const READY_REQUEST: &[u8] = b"GET /ready HTTP/1.1\r\nHost: lapada\r\nConnection: close\r\n\r\n";
@@ -40,6 +42,12 @@ static START: OnceLock<Instant> = OnceLock::new();
 /// FD upstream paths, parsed once from FD_UPSTREAMS env var.
 /// None = proxy mode (default).  Some = FD-passing mode.
 static FD_UPSTREAMS: OnceLock<[String; 2]> = OnceLock::new();
+
+/// Persistent Unix control sockets to each API's FD receiver.
+/// connect-per-client is replaced by one long-lived connection per backend.
+/// On sendmsg failure the slot is set to None; the next pass_fd_to_api call reconnects.
+#[cfg(target_os = "linux")]
+static FD_CTRL_SOCKS: OnceLock<[AsyncMutex<Option<UnixStream>>; 2]> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 fn set_int_sockopt(
@@ -81,12 +89,27 @@ fn mark_backend_failed(idx: usize) {
 
 async fn connect_backend(idx: usize) -> io::Result<UnixStream> {
     if !backend_available(idx) {
-        return Err(io::Error::new(io::ErrorKind::WouldBlock, "backend cooling down"));
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "backend cooling down",
+        ));
     }
     match timeout(CONNECT_TIMEOUT, UnixStream::connect(BACKENDS[idx])).await {
-        Ok(Ok(stream)) => { DOWN_UNTIL_MS[idx].store(0, Ordering::Relaxed); Ok(stream) }
-        Ok(Err(err))   => { mark_backend_failed(idx); Err(err) }
-        Err(_)         => { mark_backend_failed(idx); Err(io::Error::new(io::ErrorKind::TimedOut, "backend connect timeout")) }
+        Ok(Ok(stream)) => {
+            DOWN_UNTIL_MS[idx].store(0, Ordering::Relaxed);
+            Ok(stream)
+        }
+        Ok(Err(err)) => {
+            mark_backend_failed(idx);
+            Err(err)
+        }
+        Err(_) => {
+            mark_backend_failed(idx);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "backend connect timeout",
+            ))
+        }
     }
 }
 
@@ -103,10 +126,16 @@ where
     W: AsyncWrite + Unpin + ?Sized,
 {
     loop {
-        let n = match timeout(READ_TIMEOUT, reader.read(buf)).await {
-            Ok(Ok(0)) | Err(_) => { let _ = writer.shutdown().await; return Ok(()); }
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => { let _ = writer.shutdown().await; return Err(err); }
+        let n = match reader.read(buf).await {
+            Ok(0) => {
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            Ok(n) => n,
+            Err(err) => {
+                let _ = writer.shutdown().await;
+                return Err(err);
+            }
         };
         if let Err(err) = writer.write_all(&buf[..n]).await {
             let _ = writer.shutdown().await;
@@ -120,7 +149,9 @@ async fn check_backend_ready(idx: usize) -> bool {
         Ok(Ok(s)) => s,
         _ => return false,
     };
-    if stream.write_all(READY_REQUEST).await.is_err() { return false; }
+    if stream.write_all(READY_REQUEST).await.is_err() {
+        return false;
+    }
     let mut head = [0u8; 12];
     match timeout(READY_PROBE_TIMEOUT, stream.read_exact(&mut head)).await {
         Ok(Ok(_)) => head.starts_with(b"HTTP/1.1 200"),
@@ -155,33 +186,78 @@ fn bind_listener(listen_addr: &str) -> io::Result<TcpListener> {
     {
         let fd = socket.as_raw_fd();
         set_int_sockopt(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1);
-        set_int_sockopt(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, LISTEN_BACKLOG as libc::c_int);
+        set_int_sockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN,
+            LISTEN_BACKLOG as libc::c_int,
+        );
     }
     socket.bind(addr)?;
     socket.listen(LISTEN_BACKLOG)
 }
 
-/// Send the client file descriptor to an API instance via SCM_RIGHTS.
-/// Connects to `control_path` (Unix socket), sends 1 byte + the FD as ancillary data, closes.
-/// Linux-only: contest deployment is always Linux.
-///
-/// Note: `sendmsg` is a blocking syscall executed inside a tokio async task on a
-/// `current_thread` runtime.  A loopback `sendmsg` to a Unix socket completes in <5 µs
-/// which is acceptable to block the single reactor thread briefly (~4.5 ms/s at 900 req/s
-/// total load).  Promoting to `spawn_blocking` would add ~10–50 µs of thread-pool
-/// round-trip overhead per connection, which is worse.  If load grows significantly,
-/// revisit with a persistent per-backend control stream.
+/// Pass the client FD to the API at `backend_idx` via the persistent control socket.
+/// Reconnects automatically if the control connection has dropped.
+/// Linux-only: FD passing requires SCM_RIGHTS which is not portable.
 #[cfg(target_os = "linux")]
-async fn pass_fd_to_api(client: TcpStream, control_path: &str) {
+async fn pass_fd_to_api(client: &TcpStream, backend_idx: usize) -> io::Result<()> {
+    let fd_upstreams = FD_UPSTREAMS.get().unwrap();
+    let ctrl_socks = FD_CTRL_SOCKS.get().unwrap();
     let client_fd = client.as_raw_fd();
 
-    // Connect to the API's control socket (async).
-    let ctrl = match timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(control_path)).await {
-        Ok(Ok(s)) => s,
-        _ => return, // API not ready; drop connection
-    };
-    let ctrl_fd = ctrl.as_raw_fd();
+    let mut guard = ctrl_socks[backend_idx].lock().await;
+    if guard.is_none() {
+        match timeout(
+            CONNECT_TIMEOUT,
+            UnixStream::connect(&fd_upstreams[backend_idx]),
+        )
+        .await
+        {
+            Ok(Ok(s)) => *guard = Some(s),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fd ctrl connect timeout",
+                ))
+            }
+        }
+    }
 
+    match send_fd_on_ctrl(guard.as_ref().unwrap(), client_fd).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Persistent connection broken; Java side will re-accept after seeing EOF.
+            *guard = None;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn send_fd_on_ctrl(ctrl: &UnixStream, client_fd: std::os::fd::RawFd) -> io::Result<()> {
+    loop {
+        match send_fd(ctrl.as_raw_fd(), client_fd) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                ctrl.writable().await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn pass_fd_to_api(_client: &TcpStream, _backend_idx: usize) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "FD passing is Linux-only",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn send_fd(ctrl_fd: std::os::fd::RawFd, client_fd: std::os::fd::RawFd) -> io::Result<()> {
     unsafe {
         let mut data: u8 = 0;
         let mut iov = libc::iovec {
@@ -191,41 +267,52 @@ async fn pass_fd_to_api(client: TcpStream, control_path: &str) {
 
         let fd_size = std::mem::size_of::<libc::c_int>() as u32;
         let cmsg_space = libc::CMSG_SPACE(fd_size) as usize;
-        let mut cmsg_buf = vec![0u8; cmsg_space];
+        let mut cmsg_buf = [0u8; 64];
+        if cmsg_space > cmsg_buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SCM_RIGHTS buffer too small",
+            ));
+        }
+
         let cmsg = cmsg_buf.as_mut_ptr() as *mut libc::cmsghdr;
-        (*cmsg).cmsg_len    = libc::CMSG_LEN(fd_size) as _;
-        (*cmsg).cmsg_level  = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type   = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size) as _;
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         std::ptr::write(libc::CMSG_DATA(cmsg) as *mut libc::c_int, client_fd);
 
-        // Use zeroed() + field assignment: musl's msghdr has private __pad1/__pad2
-        // fields that prevent struct-literal construction on Alpine.
         let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_name       = std::ptr::null_mut();
-        msg.msg_namelen    = 0;
-        msg.msg_iov        = &mut iov as *mut libc::iovec;
-        msg.msg_iovlen     = 1;
-        msg.msg_control    = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_iov = &mut iov as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = cmsg_space as _;
-        msg.msg_flags      = 0;
-        libc::sendmsg(ctrl_fd, &msg as *const libc::msghdr, 0);
+
+        loop {
+            let sent = libc::sendmsg(ctrl_fd, &msg as *const libc::msghdr, libc::MSG_NOSIGNAL);
+            if sent == 1 {
+                return Ok(());
+            }
+            if sent < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short SCM_RIGHTS send",
+            ));
+        }
     }
-
-    // ctrl is dropped here (closes control connection).
-    // client is dropped here (closes lapada's copy; API holds its own fd via SCM_RIGHTS).
-    drop(ctrl);
-    drop(client);
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn pass_fd_to_api(_client: TcpStream, _control_path: &str) {
-    // FD passing is Linux-only; non-Linux builds fall through to the proxy path.
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
-    unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 0_u64); }
+    unsafe {
+        libc::prctl(libc::PR_SET_TIMERSLACK, 0_u64);
+    }
 
     // Parse FD_UPSTREAMS once: "path1,path2"
     let fd_mode = if let Ok(val) = env::var("FD_UPSTREAMS") {
@@ -242,6 +329,12 @@ async fn main() -> std::io::Result<()> {
         false
     };
 
+    // Initialize persistent control socket slots (connect lazily on first client).
+    #[cfg(target_os = "linux")]
+    if fd_mode {
+        let _ = FD_CTRL_SOCKS.set([AsyncMutex::new(None), AsyncMutex::new(None)]);
+    }
+
     let listen_addr = env::var("LAPADA_LISTEN").unwrap_or_else(|_| "0.0.0.0:9999".into());
     let listener = bind_listener(&listen_addr)?;
 
@@ -253,7 +346,10 @@ async fn main() -> std::io::Result<()> {
     loop {
         let (mut client, _peer) = match listener.accept().await {
             Ok(c) => c,
-            Err(e) => { eprintln!("[lapada] accept failed: {e}"); continue; }
+            Err(e) => {
+                eprintln!("[lapada] accept failed: {e}");
+                continue;
+            }
         };
         let _ = client.set_nodelay(true);
         #[cfg(target_os = "linux")]
@@ -271,12 +367,22 @@ async fn main() -> std::io::Result<()> {
         }
 
         let idx = RR.fetch_xor(1, Ordering::Relaxed) as usize;
+        let second_idx = (idx + 1) % 2;
 
         if fd_mode {
-            // FD-passing path: send the accepted socket directly to the API.
-            let control_path = FD_UPSTREAMS.get().unwrap()[idx].clone();
             tokio::spawn(async move {
-                pass_fd_to_api(client, &control_path).await;
+                let mut passed = false;
+                if backend_available(idx) {
+                    match pass_fd_to_api(&client, idx).await {
+                        Ok(()) => passed = true,
+                        Err(_) => mark_backend_failed(idx),
+                    }
+                }
+                if !passed && backend_available(second_idx) {
+                    if pass_fd_to_api(&client, second_idx).await.is_err() {
+                        mark_backend_failed(second_idx);
+                    }
+                }
             });
         } else {
             // Proxy path: copy bidirectionally through lapada.
@@ -292,7 +398,10 @@ async fn main() -> std::io::Result<()> {
                 let (mut ur, mut uw) = upstream.split();
                 let mut c2u = [0u8; COPY_BUF];
                 let mut u2c = [0u8; COPY_BUF];
-                let _ = tokio::join!(pump(&mut cr, &mut uw, &mut c2u), pump(&mut ur, &mut cw, &mut u2c));
+                let _ = tokio::join!(
+                    pump(&mut cr, &mut uw, &mut c2u),
+                    pump(&mut ur, &mut cw, &mut u2c)
+                );
             });
         }
     }

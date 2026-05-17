@@ -2,6 +2,7 @@ package com.github.gb.moonshot.http;
 
 import java.io.IOException;
 import java.net.StandardProtocolFamily;
+import java.net.StandardSocketOptions;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -13,21 +14,25 @@ import java.util.Set;
 /**
  * Listens on a Unix control socket for lapada FD-passing connections.
  *
- * <p>Protocol: lapada connects → sends one client TCP socket FD via
- * {@code sendmsg(SCM_RIGHTS)} → closes control connection.  For each received FD,
- * a virtual thread is started that handles the full HTTP/1.1 keep-alive lifetime
- * via {@link FdConnHandler}.
+ * <p>Protocol: lapada connects once and holds a persistent control connection.
+ * For each client TCP socket it accepts, lapada sends the raw fd via
+ * {@code sendmsg(SCM_RIGHTS)} over the persistent connection.
  *
- * <p>Unlike {@link NioHttpServer}, this uses one virtual thread per connection rather
- * than a single-thread NIO event loop.  For the contest's ~100 concurrent connections,
- * virtual-thread overhead is negligible while the code is significantly simpler.
+ * <p>On the Java side, {@link #acceptLoop} accepts one control connection at a time.
+ * A dedicated platform thread runs {@link #recvLoop}, calling {@link FdPassing#receive}
+ * in a tight loop. Each received fd is wrapped as a non-blocking {@link SocketChannel}
+ * and injected into {@link NioHttpServer}'s selector via {@link NioHttpServer#injectChannel},
+ * so FD-passed connections share the same single-thread NIO event loop as regular
+ * UDS connections — no virtual thread per connection.
+ *
+ * <p>When the persistent control connection drops (lapada restart or sendmsg failure),
+ * {@code recvLoop} exits and {@code acceptLoop} waits for lapada to reconnect.
  */
 public final class FdReceiver {
 
     /**
-     * {@code sun.nio.ch.SelChImpl.getFDVal()} cached at class-load.  Called once per
-     * accepted control connection (~450/s) to extract the raw OS fd for {@link FdPassing#receive}.
-     * Caching avoids per-call {@link Class#forName} + {@link Class#getDeclaredMethod} lookups.
+     * {@code sun.nio.ch.SelChImpl.getFDVal()} cached at class-load. Called once per
+     * accepted control connection to extract the raw OS fd for {@link FdPassing#receive}.
      */
     private static final java.lang.reflect.Method GET_FD_VAL;
 
@@ -42,11 +47,11 @@ public final class FdReceiver {
     }
 
     private final String socketPath;
-    private final Router router;
+    private final NioHttpServer nioServer;
 
-    public FdReceiver(String socketPath, Router router) {
+    public FdReceiver(String socketPath, NioHttpServer nioServer) {
         this.socketPath = socketPath;
-        this.router = router;
+        this.nioServer = nioServer;
     }
 
     /**
@@ -59,7 +64,6 @@ public final class FdReceiver {
         ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
         server.bind(addr, 1024);
 
-        // HAProxy must be able to connect as non-root.
         Set<PosixFilePermission> rw666 = EnumSet.of(
                 PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
                 PosixFilePermission.GROUP_READ, PosixFilePermission.GROUP_WRITE,
@@ -80,45 +84,46 @@ public final class FdReceiver {
             try {
                 SocketChannel control = server.accept();
                 if (control == null) continue;
-                // Each lapada control connection may carry one FD (connect-per-client model).
-                // Start a virtual thread to receive the FD and handle the connection.
-                Thread.startVirtualThread(() -> receiveAndHandle(control));
-            } catch (IOException e) {
+                // One platform thread per persistent control connection (lapada reconnects rarely).
+                SocketChannel capturedControl = control;
+                Thread.ofPlatform().daemon(true).name("rinha-fd-recv").start(() -> recvLoop(capturedControl));
+            } catch (Throwable e) {
                 if (!Thread.interrupted()) e.printStackTrace();
             }
         }
     }
 
     /**
-     * Receive one FD from the lapada control connection, then handle the TCP connection.
-     * The control channel is closed after the FD is received (lapada uses connect-per-client).
+     * Receive FDs in a tight loop from a persistent lapada control connection.
+     * Each received fd is wrapped as a non-blocking SocketChannel and injected into the NIO selector.
+     * Returns when the connection drops (recvmsg returns -1).
      */
-    private void receiveAndHandle(SocketChannel control) {
-        int rawFd;
-        try {
-            // Extract the raw socket FD of the control channel for recvmsg().
-            int controlFd = extractRawFd(control);
-            rawFd = FdPassing.receive(controlFd);
-        } finally {
+    private void recvLoop(SocketChannel control) {
+        int controlFd = extractRawFd(control);
+        while (true) {
+            int rawFd = FdPassing.receive(controlFd);
+            if (rawFd < 0) break;
+            SocketChannel ch = null;
             try {
-                control.close();
-            } catch (IOException ignored) {
+                ch = FdConnHandler.wrapFd(rawFd);
+                ch.configureBlocking(false);
+                ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
+                nioServer.injectChannel(ch);
+            } catch (Throwable t) {
+                if (ch != null) {
+                    try { ch.close(); } catch (IOException ignored) {}
+                }
             }
         }
-
-        if (rawFd < 0) return; // nothing received
-
-        // The virtual thread we're already on handles the full connection lifetime.
-        FdConnHandler.handle(rawFd, router);
+        try { control.close(); } catch (IOException ignored) {}
+        // acceptLoop will accept the next persistent control connection from lapada.
     }
 
     /**
      * Extract the raw OS file descriptor from a {@link SocketChannel} via the
-     * {@code sun.nio.ch.SelChImpl} internal interface exposed on NIO channels.
-     * Equivalent to {@code ((sun.nio.ch.SelChImpl) channel).getFDVal()}.
-     * The Method object is cached in {@link #GET_FD_VAL} to avoid per-call reflection overhead.
+     * {@code sun.nio.ch.SelChImpl} internal interface.
      */
-    private static int extractRawFd(SocketChannel channel) {
+    static int extractRawFd(SocketChannel channel) {
         try {
             return (int) GET_FD_VAL.invoke(channel);
         } catch (Exception e) {

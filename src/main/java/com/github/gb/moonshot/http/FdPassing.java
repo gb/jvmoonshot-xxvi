@@ -7,12 +7,10 @@ import java.lang.invoke.MethodHandle;
  * Linux-only FD-passing primitives via Panama Foreign Function & Memory API.
  *
  * <p>{@link #receive(int)} wraps {@code recvmsg()} with {@code SCM_RIGHTS} to receive a file
- * descriptor sent by lapada over a control Unix socket.  Each call uses a thread-confined
+ * descriptor sent by lapada over a control Unix socket. {@link #send(int, int)} mirrors the
+ * same layout for in-JVM AOT training. Each call uses a thread-confined
  * {@link Arena} that is allocated once per thread and reused across calls — no per-call
  * allocation on the Java heap.
- *
- * <p>{@link #setTcpNoDelay(int)} wraps {@code setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)} so the
- * received TCP socket behaves the same as one accepted by {@link NioHttpServer}.
  *
  * <p>All native memory layouts are for Linux x86-64 (glibc 64-bit).
  * {@code struct msghdr}: 56 bytes  (msg_name 8, msg_namelen 4, pad 4, msg_iov 8,
@@ -22,10 +20,6 @@ import java.lang.invoke.MethodHandle;
  * FD data at CMSG_DATA offset 16 (4 bytes).  CMSG_SPACE(4) = CMSG_ALIGN(20) = 24 bytes.
  */
 public final class FdPassing {
-
-    // ---- setsockopt constants ----
-    private static final int IPPROTO_TCP = 6;
-    private static final int TCP_NODELAY = 1;
 
     // ---- SOL_SOCKET / SCM_RIGHTS ----
     private static final int SOL_SOCKET = 1;
@@ -53,7 +47,7 @@ public final class FdPassing {
 
     // ---- native method handles (found once, cached) ----
     private static final MethodHandle RECVMSG;
-    private static final MethodHandle SETSOCKOPT;
+    private static final MethodHandle SENDMSG;
 
     static {
         Linker linker = Linker.nativeLinker();
@@ -68,16 +62,13 @@ public final class FdPassing {
                         ValueLayout.JAVA_INT     // int flags
                 )
         );
-
-        SETSOCKOPT = linker.downcallHandle(
-                lookup.find("setsockopt").orElseThrow(() -> new RuntimeException("setsockopt not found")),
+        SENDMSG = linker.downcallHandle(
+                lookup.find("sendmsg").orElseThrow(() -> new RuntimeException("sendmsg not found")),
                 FunctionDescriptor.of(
-                        ValueLayout.JAVA_INT,  // int return
-                        ValueLayout.JAVA_INT,  // int sockfd
-                        ValueLayout.JAVA_INT,  // int level
-                        ValueLayout.JAVA_INT,  // int optname
-                        ValueLayout.ADDRESS,   // const void* optval
-                        ValueLayout.JAVA_INT   // socklen_t optlen
+                        ValueLayout.JAVA_LONG,   // ssize_t
+                        ValueLayout.JAVA_INT,    // int sockfd
+                        ValueLayout.ADDRESS,     // struct msghdr*
+                        ValueLayout.JAVA_INT     // int flags
                 )
         );
     }
@@ -93,7 +84,6 @@ public final class FdPassing {
         final MemorySegment iovec;    // struct iovec
         final MemorySegment dataByte; // 1-byte iov_base payload
         final MemorySegment cmsgBuf;  // cmsghdr + FD data
-        final MemorySegment intVal;   // 4-byte int for setsockopt optval
 
         ThreadBuffers() {
             arena = Arena.ofConfined();
@@ -101,7 +91,6 @@ public final class FdPassing {
             iovec = arena.allocate(IOVEC_SIZE, 8);
             dataByte = arena.allocate(1, 1);
             cmsgBuf = arena.allocate(CMSG_SPACE, 8);
-            intVal = arena.allocate(4, 4);
 
             // Wire up iovec → dataByte (constant across calls).
             iovec.set(ValueLayout.ADDRESS, OFF_IOV_BASE, dataByte);
@@ -160,15 +149,22 @@ public final class FdPassing {
     }
 
     /**
-     * Set {@code TCP_NODELAY=1} on a raw socket FD so pipelined keep-alive responses
-     * are flushed immediately without Nagle delay.
+     * Send one file descriptor over a connected Unix control socket. Used only by
+     * {@link NioAotTraining}; lapada has the production sender.
      */
-    public static void setTcpNoDelay(int fd) {
+    static boolean send(int controlSocketFd, int fdToSend) {
         ThreadBuffers b = BUFS.get();
-        b.intVal.set(ValueLayout.JAVA_INT, 0, 1);
+        b.dataByte.set(ValueLayout.JAVA_BYTE, 0, (byte) 0);
+        b.cmsgBuf.set(ValueLayout.JAVA_LONG, OFF_CMSG_LEN, CMSG_LEN_VALUE);
+        b.cmsgBuf.set(ValueLayout.JAVA_INT, OFF_CMSG_LEVEL, SOL_SOCKET);
+        b.cmsgBuf.set(ValueLayout.JAVA_INT, OFF_CMSG_TYPE, SCM_RIGHTS);
+        b.cmsgBuf.set(ValueLayout.JAVA_INT, OFF_CMSG_DATA, fdToSend);
+        b.msghdr.set(ValueLayout.JAVA_LONG, OFF_MSG_CONTROLLEN, CMSG_SPACE);
+
         try {
-            SETSOCKOPT.invokeExact(fd, IPPROTO_TCP, TCP_NODELAY, b.intVal, 4);
-        } catch (Throwable ignored) {
+            return (long) SENDMSG.invokeExact(controlSocketFd, b.msghdr, 0) == 1L;
+        } catch (Throwable t) {
+            return false;
         }
     }
 

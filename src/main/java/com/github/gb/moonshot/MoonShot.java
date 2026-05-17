@@ -40,17 +40,19 @@ public final class MoonShot {
 
         new WarmupDriver(index, parser, vectorizer, router).run();
         SocketAddress addr = listenAddress();
-        new NioHttpServer().start(addr, router);
+        NioHttpServer nioServer = new NioHttpServer();
+        nioServer.start(addr, router);
 
         preinitAotClasses();
         runLiveListenerPump(addr);
+        String fdSocket = startFdReceiver(nioServer);
 
         if (aotTrainingMode()) {
-            log("AOT_TRAINING=1 exiting after live-listener pump");
+            runFdPassingPump(fdSocket);
+            log("AOT_TRAINING=1 exiting after live-listener and FD-passing pumps");
             System.exit(0);
         }
 
-        startFdReceiver(router);
         router.markReady();
         log("listening on " + addr);
     }
@@ -59,6 +61,7 @@ public final class MoonShot {
         // Static initializers (SocketChannelImpl + FileDescriptor reflection) must run during
         // AOT training to appear in the Leyden compilation profile.
         try {
+            Class.forName("com.github.gb.moonshot.http.FdPassing");
             Class.forName("com.github.gb.moonshot.http.FdConnHandler");
             Class.forName("com.github.gb.moonshot.http.FdReceiver");
         } catch (ClassNotFoundException | ExceptionInInitializerError ignored) {
@@ -66,13 +69,14 @@ public final class MoonShot {
         }
     }
 
-    private static void startFdReceiver(Router router) throws IOException {
+    private static String startFdReceiver(NioHttpServer nioServer) throws IOException {
         // Starts before markReady so the receiver is listening when lapada gets the ready signal.
         String fdSocket = env("FD_SOCKET", "");
         if (!fdSocket.isEmpty()) {
-            new FdReceiver(fdSocket, router).start();
+            new FdReceiver(fdSocket, nioServer).start();
             log("FD receiver listening on " + fdSocket);
         }
+        return fdSocket;
     }
 
     /**
@@ -89,6 +93,19 @@ public final class MoonShot {
         long t0 = System.nanoTime();
         int done = NioAotTraining.trainLiveListener(addr, frames, iters, deadlineNanos, connections);
         log("live-listener pump: " + done + " requests in " + millisSince(t0) + " ms");
+    }
+
+    private static void runFdPassingPump(String fdSocket) {
+        if (fdSocket.isEmpty()) return;
+        int iters = Integer.parseInt(env("FD_WARMUP_ITERS", env("LIVE_WARMUP_ITERS", "15000")));
+        int connections = Integer.parseInt(env("FD_WARMUP_CONNECTIONS", env("LIVE_WARMUP_CONNECTIONS", "100")));
+        long deadlineNanos = System.nanoTime() + 10_000L * 1_000_000L;
+        byte[][] bodies = WarmupDriver.loadBodies();
+        byte[][] frames = Arrays.stream(bodies).map(WarmupDriver::buildHttpFrame).toArray(byte[][]::new);
+
+        long t0 = System.nanoTime();
+        int done = NioAotTraining.trainFdPassing(fdSocket, frames, iters, deadlineNanos, connections);
+        log("FD-passing pump: " + done + " requests in " + millisSince(t0) + " ms");
     }
 
     private static SocketAddress listenAddress() throws Exception {

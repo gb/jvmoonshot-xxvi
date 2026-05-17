@@ -57,6 +57,12 @@ public final class KdTree implements VectorIndex {
 
     static final int LANE_LEFT_DIM = KdTreeLayout.LANE_LEFT_DIM; // 14 — leftAndDim packed at pts[14..15]
     static final int LANE_RIGHT = 16; // right packed at pts[16..17]
+    /**
+     * Lane 18: fraud flag packed into the previously-unused padding short.
+     * Value is 0 (not fraud) or 1 (fraud). Eliminates the separate on-heap fraud[] byte array
+     * in mmap mode, freeing ~3 MB of L3 that was displaced by the heap allocation.
+     */
+    static final int LANE_FRAUD = 18;
 
     public static final int TOP_BBOX_DEPTH = 18;
     public static final int BBF_MAX_DEPTH = 18;
@@ -309,7 +315,11 @@ public final class KdTree implements VectorIndex {
         prime(scratch, TopKSortedArray.MAX_K);
         descendBBF(scratch, TopKSortedArray.MAX_K);
         if (PROFILING_ENABLED) scratch.finalPeekDist = scratch.results.peekDist();
-        return scratch.results.countFrauds(fraud);
+        // Mmap mode: fraud flag is in pts lane 18 (no separate heap array).
+        // Heap mode: read from the fraud[] byte array.
+        return ptsSeg != null
+                ? scratch.results.countFraudsFromMmap(KdTreeUnsafe.ptsBaseAddr, STRIDE)
+                : scratch.results.countFrauds(fraud);
     }
 
     @Override
@@ -324,8 +334,16 @@ public final class KdTree implements VectorIndex {
         int[] treeIdxs = scratch.topKBuf;
         int count = scratch.results.drainAscending(treeIdxs);
         int fraudCount = 0;
-        for (int i = 0; i < Math.min(k, count); i++) {
-            if (fraud[treeIdxs[i]] != 0) fraudCount++;
+        if (ptsSeg != null) {
+            long base = KdTreeUnsafe.ptsBaseAddr;
+            for (int i = 0; i < Math.min(k, count); i++) {
+                fraudCount += KdTreeUnsafe.UNSAFE.getShort(
+                        base + (long) treeIdxs[i] * (STRIDE * 2L) + LANE_FRAUD * 2L) & 1;
+            }
+        } else {
+            for (int i = 0; i < Math.min(k, count); i++) {
+                if (fraud[treeIdxs[i]] != 0) fraudCount++;
+            }
         }
         return fraudCount;
     }
