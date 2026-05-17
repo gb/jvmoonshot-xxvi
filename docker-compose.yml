@@ -3,7 +3,6 @@ services:
     image: ghcr.io/gb/lapada:v8
     platform: linux/amd64
     container_name: rinha-lb
-    cpuset: "0,1"
     ports:
       - "9999:9999"
     environment:
@@ -34,7 +33,6 @@ services:
     image: ghcr.io/gb/jvmoonshot-xxvi:v10
     platform: linux/amd64
     container_name: rinha-api1
-    cpuset: "0,1"
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
@@ -59,7 +57,6 @@ services:
     image: ghcr.io/gb/jvmoonshot-xxvi:v10
     platform: linux/amd64
     container_name: rinha-api2
-    cpuset: "0,1"
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
