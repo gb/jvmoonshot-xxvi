@@ -37,7 +37,6 @@ services:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
       KDTREE_EARLY_DIST_MILLI: "140"
-      KDTREE_RELAX_EPSILON: "0.005"
     volumes:
       - sockets:/sockets
     sysctls:
@@ -63,7 +62,6 @@ services:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
       KDTREE_EARLY_DIST_MILLI: "140"
-      KDTREE_RELAX_EPSILON: "0.005"
     volumes:
       - sockets:/sockets
     sysctls:
