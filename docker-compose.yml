@@ -10,8 +10,10 @@ services:
     volumes:
       - sockets:/sockets
     depends_on:
-      - api1
-      - api2
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     ulimits:
       nofile:
         soft: 65535
@@ -29,12 +31,20 @@ services:
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
+      READY_FILE: /sockets/api1.ready
       KDTREE_RELAX_SOFT_CAP: "900"
       KDTREE_RELAX_RANGE: "700"
       KDTREE_RELAX_EPSILON: "0"
       FRAUD_CACHE_BITS: "0"
     volumes:
       - sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /sockets/api1.ready && test -S /sockets/api1-fd.sock"]
+      interval: 30s
+      timeout: 1s
+      retries: 30
+      start_period: 30s
+      start_interval: 1s
     ulimits:
       nofile:
         soft: 65535
@@ -52,12 +62,20 @@ services:
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
+      READY_FILE: /sockets/api2.ready
       KDTREE_RELAX_SOFT_CAP: "900"
       KDTREE_RELAX_RANGE: "700"
       KDTREE_RELAX_EPSILON: "0"
       FRAUD_CACHE_BITS: "0"
     volumes:
       - sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /sockets/api2.ready && test -S /sockets/api2-fd.sock"]
+      interval: 30s
+      timeout: 1s
+      retries: 30
+      start_period: 30s
+      start_interval: 1s
     ulimits:
       nofile:
         soft: 65535
