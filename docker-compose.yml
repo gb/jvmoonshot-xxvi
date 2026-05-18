@@ -29,7 +29,6 @@ services:
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
-      KDTREE_EARLY_DIST_MILLI: "140"
       KDTREE_RELAX_SOFT_CAP: "900"
       KDTREE_RELAX_RANGE: "700"
       KDTREE_RELAX_EPSILON: "0"
@@ -53,7 +52,6 @@ services:
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
-      KDTREE_EARLY_DIST_MILLI: "140"
       KDTREE_RELAX_SOFT_CAP: "900"
       KDTREE_RELAX_RANGE: "700"
       KDTREE_RELAX_EPSILON: "0"
