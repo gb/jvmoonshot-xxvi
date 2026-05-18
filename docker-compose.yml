@@ -1,6 +1,6 @@
 services:
   lapada:
-    image: ghcr.io/gb/lapada:v10
+    image: ghcr.io/gb/lapada:v11
     platform: linux/amd64
     container_name: rinha-lb
     ports:
