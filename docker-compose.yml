@@ -21,8 +21,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.12"
-          memory: "16M"
+          cpus: "0.10"
+          memory: "10M"
 
   api1:
     image: ghcr.io/gb/jvmoonshot-xxvi:v18
@@ -52,8 +52,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.44"
-          memory: "167M"
+          cpus: "0.45"
+          memory: "170M"
 
   api2:
     image: ghcr.io/gb/jvmoonshot-xxvi:v18
@@ -83,8 +83,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.44"
-          memory: "167M"
+          cpus: "0.45"
+          memory: "170M"
 
 volumes:
   sockets:
