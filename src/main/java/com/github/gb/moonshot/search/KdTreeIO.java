@@ -20,7 +20,7 @@ import static com.github.gb.moonshot.search.KdTree.*;
  */
 public final class KdTreeIO {
 
-    static final String MAGIC = "RKDTS021"; // RKDT + S(short) + 021: fraud packed into pts lane 18
+    static final String MAGIC = "RKDTS022"; // RKDT + S(short) + 022: DIM_PERMUTATION changed
 
     private static final int HEADER_BYTES = 8 + 4 * 4; // magic + n, dims, stride, root
     private static final int IO_CHUNK = 8 * 1024 * 1024;

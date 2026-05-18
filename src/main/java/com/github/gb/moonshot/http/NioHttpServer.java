@@ -17,6 +17,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
@@ -41,6 +42,7 @@ public final class NioHttpServer {
 
     /** FD-passed channels queued by {@link FdReceiver} for registration on the next select() iteration. */
     private final ConcurrentLinkedQueue<SocketChannel> pendingChannels = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean pendingWakeupArmed = new AtomicBoolean();
     private volatile Selector selectorRef;
 
     /** @return the IO loop thread (used by allocation profilers via {@code ThreadMXBean}). */
@@ -72,7 +74,7 @@ public final class NioHttpServer {
         this.selectorRef = selector; // visible to injectChannel() after Thread.start() happens-before
         server.register(selector, SelectionKey.OP_ACCEPT);
 
-        Thread t = new Thread(() -> loop(selector, server, router, !unix, pendingChannels), "rinha-io");
+        Thread t = new Thread(() -> loop(selector, server, router, !unix, pendingChannels, pendingWakeupArmed), "rinha-io");
         t.setDaemon(false);
         // Best effort only; some container runtimes ignore Java priorities, but when honored this keeps the
         // selector/response thread ahead of warmup leftovers and JVM housekeeping during the contest window.
@@ -89,11 +91,11 @@ public final class NioHttpServer {
     public void injectChannel(SocketChannel ch) {
         pendingChannels.add(ch);
         Selector sel = selectorRef;
-        if (sel != null) sel.wakeup();
+        if (sel != null && pendingWakeupArmed.compareAndSet(false, true)) sel.wakeup();
     }
 
     private static void loop(Selector selector, ServerSocketChannel server, Router router, boolean tcpOptions,
-                             ConcurrentLinkedQueue<SocketChannel> pending) {
+                             ConcurrentLinkedQueue<SocketChannel> pending, AtomicBoolean pendingWakeupArmed) {
         // Allocated once; select(Consumer) auto-removes keys after callback returns.
         Consumer<SelectionKey> handle = key -> {
             try {
@@ -112,7 +114,9 @@ public final class NioHttpServer {
                 // Drain FD-passed channels before blocking. ConcurrentLinkedQueue.poll() is
                 // wait-free; draining here (on the selector thread) avoids any locking on Selector.
                 SocketChannel inj;
+                boolean drainedInjected = false;
                 while ((inj = pending.poll()) != null) {
+                    drainedInjected = true;
                     try {
                         inj.register(selector, SelectionKey.OP_READ, new HttpConnection());
                     } catch (Throwable t) {
@@ -120,7 +124,16 @@ public final class NioHttpServer {
                         try { inj.close(); } catch (IOException ignored) {}
                     }
                 }
-                selector.select(handle);
+                if (drainedInjected) {
+                    pendingWakeupArmed.set(false);
+                }
+                // Non-blocking pass first: under keep-alive load the next request bytes are already
+                // in the socket buffer by the time we finish flushing the response. selectNow() catches
+                // them without an epoll_wait syscall (~10-50µs saved per round-trip). Only block when
+                // truly idle (selectNow found nothing AND no FD-passed channels queued).
+                if (selector.selectNow(handle) == 0 && pending.isEmpty()) {
+                    selector.select(handle);
+                }
             } catch (Throwable t) {
                 // One bad select() iteration must not terminate the loop; loop-fatal conditions surface via
                 // Thread.interrupted.

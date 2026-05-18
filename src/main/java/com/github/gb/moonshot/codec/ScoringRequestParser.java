@@ -90,7 +90,6 @@ public final class ScoringRequestParser {
         cursor.skipWs();
         cursor.expect('{');
         while (cursor.skipWsAndPeek() != '}') {
-            cursor.skipWs();
             int key = cursor.readTopKey();
             cursor.skipWs();
             cursor.expect(':');
@@ -123,14 +122,13 @@ public final class ScoringRequestParser {
     private void parseTransaction(ScoringRequestScratch scratch) {
         cursor.expect('{');
         while (cursor.skipWsAndPeek() != '}') {
-            cursor.skipWs();
             int fieldKey = cursor.readTransactionKey();
             cursor.skipWs();
             cursor.expect(':');
             cursor.skipWs();
             switch (fieldKey) {
                 case K_TX_AMOUNT -> scratch.amount = cursor.readNumber();
-                case K_TX_INSTALLMENTS -> scratch.installments = (int) cursor.readNumber();
+                case K_TX_INSTALLMENTS -> scratch.installments = cursor.readInt();
                 case K_TX_REQUESTED_AT ->
                         scratch.requestedAtOffset = cursor.captureFixedString(ScoringRequestScratch.TIMESTAMP_LEN);
                 default -> cursor.skipValue();
@@ -144,14 +142,13 @@ public final class ScoringRequestParser {
     private void parseCustomer(ScoringRequestScratch scratch) {
         cursor.expect('{');
         while (cursor.skipWsAndPeek() != '}') {
-            cursor.skipWs();
             int fieldKey = cursor.readCustomerKey();
             cursor.skipWs();
             cursor.expect(':');
             cursor.skipWs();
             switch (fieldKey) {
                 case K_CUST_AVG_AMOUNT -> scratch.customerAvgAmount = cursor.readNumber();
-                case K_CUST_TX_COUNT_24H -> scratch.customerTxCount24h = (int) cursor.readNumber();
+                case K_CUST_TX_COUNT_24H -> scratch.customerTxCount24h = cursor.readInt();
                 case K_CUST_KNOWN_MERCHANTS -> cursor.captureKnownMerchants(scratch);
                 default -> cursor.skipValue();
             }
@@ -164,7 +161,6 @@ public final class ScoringRequestParser {
     private void parseMerchant(ScoringRequestScratch scratch) {
         cursor.expect('{');
         while (cursor.skipWsAndPeek() != '}') {
-            cursor.skipWs();
             int fieldKey = cursor.readMerchantKey();
             cursor.skipWs();
             cursor.expect(':');
@@ -174,6 +170,9 @@ public final class ScoringRequestParser {
                     long range = cursor.captureStringRange();
                     scratch.merchantIdOffset = (int) (range >>> 32);
                     scratch.merchantIdLength = (int) range;
+                    int code = cursor.decodeMerchantCode(scratch.merchantIdOffset, scratch.merchantIdLength);
+                    scratch.merchantIdCode = code;
+                    scratch.merchantIdCodeValid = code >= 0;
                 }
                 case K_MERCH_MCC -> scratch.mccOffset = cursor.captureFixedString(ScoringRequestScratch.MCC_LEN);
                 case K_MERCH_AVG_AMOUNT -> scratch.merchantAvgAmount = cursor.readNumber();
@@ -188,7 +187,6 @@ public final class ScoringRequestParser {
     private void parseTerminal(ScoringRequestScratch scratch) {
         cursor.expect('{');
         while (cursor.skipWsAndPeek() != '}') {
-            cursor.skipWs();
             int fieldKey = cursor.readTerminalKey();
             cursor.skipWs();
             cursor.expect(':');
@@ -213,7 +211,6 @@ public final class ScoringRequestParser {
         }
         cursor.expect('{');
         while (cursor.skipWsAndPeek() != '}') {
-            cursor.skipWs();
             int fieldKey = cursor.readLastTxKey();
             cursor.skipWs();
             cursor.expect(':');
@@ -254,70 +251,6 @@ public final class ScoringRequestParser {
         byte[] bytes;
         int end;
         int pos;
-
-        private static double parseJsonNumber(byte[] bytes, int from, int to) {
-            int pos = from;
-            boolean negative = false;
-            if (bytes[pos] == '-') {
-                negative = true;
-                pos++;
-            } else if (bytes[pos] == '+') {
-                pos++;
-            }
-
-            long intPart = 0;
-            while (pos < to) {
-                byte b = bytes[pos];
-                if (b < '0' || b > '9') break;
-                intPart = intPart * 10 + (b - '0');
-                pos++;
-            }
-
-            double value = intPart;
-            if (pos < to && bytes[pos] == '.') {
-                pos++;
-                // Accumulate fraction digits as a long then single multiply by NEG_POW10[count]: avoids the
-                // ULP drift of repeated *= 0.1d (0.1 not exact in IEEE 754) and is one long-add per digit
-                // instead of two double ops.
-                long fracDigits = 0;
-                int fracCount = 0;
-                while (pos < to) {
-                    byte b = bytes[pos];
-                    if (b < '0' || b > '9') break;
-                    fracDigits = fracDigits * 10 + (b - '0');
-                    fracCount++;
-                    pos++;
-                }
-                if (fracCount > 0) {
-                    int idx = fracCount <= MAX_POW10_INDEX ? fracCount : MAX_POW10_INDEX;
-                    value += fracDigits * NEG_POW10[idx];
-                }
-            }
-
-            if (pos < to && (bytes[pos] == 'e' || bytes[pos] == 'E')) {
-                pos++;
-                boolean exponentNegative = false;
-                if (bytes[pos] == '-') {
-                    exponentNegative = true;
-                    pos++;
-                } else if (bytes[pos] == '+') {
-                    pos++;
-                }
-                int exp = 0;
-                while (pos < to) {
-                    byte b = bytes[pos++];
-                    exp = exp * 10 + (b - '0');
-                }
-                // Lookup table for the common range; Math.pow only for out-of-table magnitudes.
-                if (exp <= MAX_POW10_INDEX) {
-                    value *= exponentNegative ? NEG_POW10[exp] : POW10[exp];
-                } else {
-                    value *= Math.pow(10.0d, exponentNegative ? -exp : exp);
-                }
-            }
-
-            return negative ? -value : value;
-        }
 
         void reset(byte[] bytes, int offset, int end) {
             this.bytes = bytes;
@@ -411,6 +344,15 @@ public final class ScoringRequestParser {
                 long range = captureStringRange();
                 scratch.knownMerchantsOffsets[count] = (int) (range >>> 32);
                 scratch.knownMerchantsLengths[count] = (int) range;
+                if (scratch.knownMerchantMaskValid) {
+                    int code = decodeMerchantCode(scratch.knownMerchantsOffsets[count],
+                            scratch.knownMerchantsLengths[count]);
+                    if (code >= 0 && code < Long.SIZE) {
+                        scratch.knownMerchantMask |= 1L << code;
+                    } else {
+                        scratch.knownMerchantMaskValid = false;
+                    }
+                }
                 scratch.knownMerchantsCount = count + 1;
                 skipWs();
                 if (bytes[pos] == ',') {
@@ -526,15 +468,79 @@ public final class ScoringRequestParser {
         }
 
         double readNumber() {
-            int start = pos;
-            byte b = bytes[pos];
-            if (b == '-' || b == '+') pos++;
-            while (pos < end) {
-                b = bytes[pos];
-                if ((b >= '0' && b <= '9') || b == '.' || b == 'e' || b == 'E' || b == '+' || b == '-') pos++;
-                else break;
+            int p = pos;
+            boolean negative = false;
+            if (bytes[p] == '-') {
+                negative = true;
+                p++;
+            } else if (bytes[p] == '+') {
+                p++;
             }
-            return parseJsonNumber(bytes, start, pos);
+
+            long intPart = 0;
+            while (p < end) {
+                byte b = bytes[p];
+                if (b < '0' || b > '9') break;
+                intPart = intPart * 10 + (b - '0');
+                p++;
+            }
+
+            double value = intPart;
+            if (p < end && bytes[p] == '.') {
+                p++;
+                long fracDigits = 0;
+                int fracCount = 0;
+                while (p < end) {
+                    byte b = bytes[p];
+                    if (b < '0' || b > '9') break;
+                    fracDigits = fracDigits * 10 + (b - '0');
+                    fracCount++;
+                    p++;
+                }
+                if (fracCount > 0) {
+                    int idx = fracCount <= MAX_POW10_INDEX ? fracCount : MAX_POW10_INDEX;
+                    value += fracDigits * NEG_POW10[idx];
+                }
+            }
+
+            if (p < end && (bytes[p] == 'e' || bytes[p] == 'E')) {
+                p++;
+                boolean exponentNegative = false;
+                if (bytes[p] == '-') {
+                    exponentNegative = true;
+                    p++;
+                } else if (bytes[p] == '+') {
+                    p++;
+                }
+                int exp = 0;
+                while (p < end) {
+                    byte b = bytes[p];
+                    if (b < '0' || b > '9') break;
+                    exp = exp * 10 + (b - '0');
+                    p++;
+                }
+                if (exp <= MAX_POW10_INDEX) {
+                    value *= exponentNegative ? NEG_POW10[exp] : POW10[exp];
+                } else {
+                    value *= Math.pow(10.0d, exponentNegative ? -exp : exp);
+                }
+            }
+
+            pos = p;
+            return negative ? -value : value;
+        }
+
+        int readInt() {
+            int p = pos;
+            int value = 0;
+            while (p < end) {
+                byte b = bytes[p];
+                if (b < '0' || b > '9') break;
+                value = value * 10 + (b - '0');
+                p++;
+            }
+            pos = p;
+            return value;
         }
 
         boolean readBool() {
@@ -603,6 +609,22 @@ public final class ScoringRequestParser {
                 expect(']');
                 return;
             }
+        }
+
+        private int decodeMerchantCode(int start, int len) {
+            if (len != 8
+                    || bytes[start] != 'M'
+                    || bytes[start + 1] != 'E'
+                    || bytes[start + 2] != 'R'
+                    || bytes[start + 3] != 'C'
+                    || bytes[start + 4] != '-') {
+                return -1;
+            }
+            byte a = bytes[start + 5];
+            byte b = bytes[start + 6];
+            byte c = bytes[start + 7];
+            if (a < '0' || a > '9' || b < '0' || b > '9' || c < '0' || c > '9') return -1;
+            return (a - '0') * 100 + (b - '0') * 10 + (c - '0');
         }
     }
 }

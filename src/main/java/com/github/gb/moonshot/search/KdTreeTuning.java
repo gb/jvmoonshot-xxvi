@@ -101,6 +101,18 @@ final class KdTreeTuning {
         PRIME_BBOX_SCORING = "1".equals(v) || "true".equalsIgnoreCase(v);
     }
 
+    // ── Boundary refinement ──────────────────────────────────────────────────────────────────────
+    // The API decision boundary is fraudCount >= 3. When relaxed pruning is enabled, only fast-path
+    // counts 2 and 3 can change approved/denied after an exact rerun. Disabled by default for this
+    // KdTree because a rerun repeats most of the expensive tree walk; it remains useful for sweeps.
+
+    static final boolean REFINE_BOUNDARY;
+
+    static {
+        String v = System.getenv("KDTREE_REFINE_BOUNDARY");
+        REFINE_BOUNDARY = "1".equals(v) || "true".equalsIgnoreCase(v);
+    }
+
     // ── Derived ───────────────────────────────────────────────────────────────────────────────────
 
     /**

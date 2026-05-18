@@ -4,8 +4,10 @@ import com.github.gb.moonshot.codec.ResponseEncoder;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.invoke.VarHandle;
 import java.net.ProtocolFamily;
 import java.net.StandardProtocolFamily;
 import java.nio.ByteBuffer;
@@ -19,9 +21,9 @@ import java.nio.channels.spi.SelectorProvider;
  * selector; the blocking {@link #handle(int, Router)} loop is kept only for
  * AOT training and diagnostics.
  *
- * <p>The {@link #SOCKET_CHANNEL_CTOR} reflection is cached at class load, so
- * the per-connection runtime cost is one constructor invocation and one
- * {@link FileDescriptor} field write before selector registration.
+ * <p>The internal constructor and {@link FileDescriptor#fd} setter are cached as
+ * method-handle/var-handle call sites at class load, so the per-connection runtime
+ * avoids reflective invocation while still skipping the OS accept() path.
  */
 public final class FdConnHandler {
 
@@ -30,19 +32,20 @@ public final class FdConnHandler {
      * — the only public-facing way to wrap a raw socket fd in a SocketChannel without
      * going through the OS accept() path.  Cached once at class load.
      */
-    private static final Constructor<?> SOCKET_CHANNEL_CTOR;
-    private static final Field FD_FIELD;
+    private static final MethodHandle SOCKET_CHANNEL_CTOR;
+    private static final VarHandle FD_FIELD;
 
     static {
         try {
             Class<?> implClass = Class.forName("sun.nio.ch.SocketChannelImpl");
             // JDK 25 changed the signature: added ProtocolFamily, generalized InetSocketAddress→SocketAddress.
-            SOCKET_CHANNEL_CTOR = implClass.getDeclaredConstructor(
-                    SelectorProvider.class, ProtocolFamily.class, FileDescriptor.class, java.net.SocketAddress.class);
-            SOCKET_CHANNEL_CTOR.setAccessible(true);
+            MethodHandles.Lookup implLookup = MethodHandles.privateLookupIn(implClass, MethodHandles.lookup());
+            SOCKET_CHANNEL_CTOR = implLookup.findConstructor(implClass, MethodType.methodType(
+                    void.class, SelectorProvider.class, ProtocolFamily.class, FileDescriptor.class,
+                    java.net.SocketAddress.class));
 
-            FD_FIELD = FileDescriptor.class.getDeclaredField("fd");
-            FD_FIELD.setAccessible(true);
+            FD_FIELD = MethodHandles.privateLookupIn(FileDescriptor.class, MethodHandles.lookup())
+                    .findVarHandle(FileDescriptor.class, "fd", int.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -52,10 +55,10 @@ public final class FdConnHandler {
      * Wrap a raw POSIX TCP socket fd in a {@link SocketChannel}.
      * The caller is responsible for setting the blocking mode and registering or handling the channel.
      */
-    static SocketChannel wrapFd(int rawFd) throws Exception {
+    static SocketChannel wrapFd(int rawFd) throws Throwable {
         FileDescriptor jfd = new FileDescriptor();
         FD_FIELD.set(jfd, rawFd);
-        return (SocketChannel) SOCKET_CHANNEL_CTOR.newInstance(
+        return (SocketChannel) SOCKET_CHANNEL_CTOR.invoke(
                 SelectorProvider.provider(), StandardProtocolFamily.INET, jfd, null);
     }
 
@@ -73,7 +76,7 @@ public final class FdConnHandler {
         try {
             channel = wrapFd(rawFd);
             channel.configureBlocking(true);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             return;
         }
 

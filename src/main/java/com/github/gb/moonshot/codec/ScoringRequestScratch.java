@@ -43,16 +43,24 @@ public final class ScoringRequestScratch {
 
     public int merchantIdOffset;
     public int merchantIdLength;
+    public int merchantIdCode;
+    public boolean merchantIdCodeValid;
 
     public int knownMerchantsCount;
     public int[] knownMerchantsOffsets = new int[16];
     public int[] knownMerchantsLengths = new int[16];
+    public long knownMerchantMask;
+    public boolean knownMerchantMaskValid;
 
     /**
      * Reset variable-cardinality state. Numeric/boolean fields are overwritten unconditionally on each parse.
      */
     public void clear() {
         knownMerchantsCount = 0;
+        knownMerchantMask = 0L;
+        knownMerchantMaskValid = true;
+        merchantIdCode = -1;
+        merchantIdCodeValid = false;
         lastTimestampOffset = ABSENT;
         requestedAtOffset = ABSENT;
     }

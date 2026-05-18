@@ -3,7 +3,7 @@
 # JVM_HEAP must be byte-identical in record/create/runtime: the AOT cache is
 # keyed on these flags. UnlockDiagnosticVMOptions is required for
 # GuaranteedSafepointInterval (diagnostic flag).
-ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=48m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:+UseFMA -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-UsePerfData -XX:+DisableExplicitGC"
+ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=48m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:+UseFMA -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-BackgroundCompilation -XX:-UsePerfData -XX:+DisableExplicitGC"
 
 FROM maven:3.9-eclipse-temurin-25 AS build
 WORKDIR /src
@@ -42,7 +42,11 @@ ENV JVM_HEAP="${JVM_HEAP}" \
     MALLOC_ARENA_MAX=1 \
     PORT=8080 \
     INDEX_KIND=kdtree-i16 \
-    KDTREE_GRAPH=/data/kdtree-i16.bin
+    KDTREE_GRAPH=/data/kdtree-i16.bin \
+    KDTREE_RELAX_SOFT_CAP=900 \
+    KDTREE_RELAX_RANGE=700 \
+    KDTREE_RELAX_EPSILON=0 \
+    FRAUD_CACHE_BITS=0
 
 # AOT_TRAINING=1 makes MoonShot.main exit after the live listener and FD-passing
 # pumps so the JVM records the same hot paths production uses behind lapada.
@@ -50,6 +54,10 @@ RUN mkdir -p /tmp/moonshot-aot \
  && LISTEN_SOCKET=/tmp/moonshot-aot/api.sock \
     FD_SOCKET=/tmp/moonshot-aot/api-fd.sock \
     AOT_TRAINING=1 \
+    KDTREE_RELAX_SOFT_CAP=900 \
+    KDTREE_RELAX_RANGE=700 \
+    KDTREE_RELAX_EPSILON=0 \
+    FRAUD_CACHE_BITS=0 \
     java $JVM_HEAP -XX:+UseSerialGC \
         --add-modules jdk.incubator.vector \
         --enable-native-access=ALL-UNNAMED \
@@ -81,7 +89,11 @@ COPY --from=build /tmp/app.aot          /app/app.aot
 ENV PORT=8080 \
     INDEX_KIND=kdtree-i16 \
     KDTREE_GRAPH=/data/kdtree-i16.bin \
-    MALLOC_ARENA_MAX=1
+    MALLOC_ARENA_MAX=1 \
+    KDTREE_RELAX_SOFT_CAP=900 \
+    KDTREE_RELAX_RANGE=700 \
+    KDTREE_RELAX_EPSILON=0 \
+    FRAUD_CACHE_BITS=0
 
 EXPOSE 8080
 

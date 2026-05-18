@@ -1,7 +1,7 @@
 package com.github.gb.moonshot.search;
 
 /**
- * Fixed-capacity k=5 candidate set kept in ascending distance order. Insertions use a backward
+ * Fixed-capacity k=5 candidate set kept in ascending raw-i16-distance order. Insertions use a backward
  * shift loop; at k=5 this outperforms a binary heap whose sift-down branches mispredict more than
  * a tight counter-bound loop. See {@code TopKMicroBench} for the A/B that confirmed the loop form.
  */
@@ -10,7 +10,7 @@ final class TopKSortedArray {
     static final int MAX_K = 5;
 
     private final int[] ids = new int[MAX_K];
-    private final float[] dists = new float[MAX_K];
+    private final int[] sums = new int[MAX_K];
     private int size;
 
     void clear() {
@@ -22,11 +22,19 @@ final class TopKSortedArray {
     }
 
     float peekDist() {
-        return dists[size - 1];
+        return sums[size - 1] * KdTree.INV_SCALE_SQ;
+    }
+
+    int peekSum() {
+        return sums[size - 1];
     }
 
     boolean contains(int id) {
-        for (int i = 0; i < size; i++) if (ids[i] == id) return true;
+        if (size > 0 && ids[0] == id) return true;
+        if (size > 1 && ids[1] == id) return true;
+        if (size > 2 && ids[2] == id) return true;
+        if (size > 3 && ids[3] == id) return true;
+        if (size > 4 && ids[4] == id) return true;
         return false;
     }
 
@@ -35,26 +43,26 @@ final class TopKSortedArray {
                 "TopKSortedArray fixed at k=" + MAX_K + "; caller requested k=" + k);
     }
 
-    void push(int id, float dist) {
+    void push(int id, int sum) {
         int pos = size;
-        while (pos > 0 && dists[pos - 1] > dist) {
-            dists[pos] = dists[pos - 1];
+        while (pos > 0 && sums[pos - 1] > sum) {
+            sums[pos] = sums[pos - 1];
             ids[pos] = ids[pos - 1];
             pos--;
         }
-        dists[pos] = dist;
+        sums[pos] = sum;
         ids[pos] = id;
         size++;
     }
 
-    void replaceFarthest(int id, float dist) {
+    void replaceFarthest(int id, int sum) {
         int pos = MAX_K - 1;
-        while (pos > 0 && dists[pos - 1] > dist) {
-            dists[pos] = dists[pos - 1];
+        while (pos > 0 && sums[pos - 1] > sum) {
+            sums[pos] = sums[pos - 1];
             ids[pos] = ids[pos - 1];
             pos--;
         }
-        dists[pos] = dist;
+        sums[pos] = sum;
         ids[pos] = id;
     }
 

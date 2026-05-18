@@ -53,6 +53,10 @@ public final class WarmupDriver {
 
     private static final int  TEMPLATE_COUNT  = 16;
     private static final long SEARCH_RNG_SEED = 0xC0DECAFE12345678L;
+    private static final byte[] HTTP_FRAME_PREFIX =
+            "POST /fraud-score HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
+                    .getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] HTTP_FRAME_SUFFIX = "\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
 
     private final VectorIndex index;
     private final ScoringRequestParser parser;
@@ -67,10 +71,12 @@ public final class WarmupDriver {
     }
 
     public void run() {
+        run(loadBodies());
+    }
+
+    public void run(byte[][] templateBodies) {
         long deadlineNanos = System.nanoTime() + WALL_CLOCK_BUDGET_MS * 1_000_000L;
         log("starting warmup (budget " + WALL_CLOCK_BUDGET_MS + " ms)");
-
-        byte[][] templateBodies = loadBodies();
 
         long t0 = System.nanoTime();
         int searchDone = warmSearch(deadlineNanos);
@@ -89,16 +95,12 @@ public final class WarmupDriver {
         long t5 = System.nanoTime();
         log("http-io done in " + ms(t5 - t4) + " ms (" + httpSocketDone + " iters)");
 
-        log(String.format(
-            "warmup done: search=%d in %d ms, parser=%d in %d ms, route=%d in %d ms, "
-            + "http-parse=%d in %d ms, http-io=%d in %d ms (total %d ms)",
-            searchDone, ms(t1 - t0),
-            parserDone, ms(t2 - t1),
-            routeDone, ms(t3 - t2),
-            httpParseDone, ms(t4 - t3),
-            httpSocketDone, ms(t5 - t4),
-            ms(t5 - t0)
-        ));
+        log("warmup done: search=" + searchDone + " in " + ms(t1 - t0)
+                + " ms, parser=" + parserDone + " in " + ms(t2 - t1)
+                + " ms, route=" + routeDone + " in " + ms(t3 - t2)
+                + " ms, http-parse=" + httpParseDone + " in " + ms(t4 - t3)
+                + " ms, http-io=" + httpSocketDone + " in " + ms(t5 - t4)
+                + " ms (total " + ms(t5 - t0) + " ms)");
     }
 
     private int warmHttpParse(long deadlineNanos, byte[][] templateBodies) {
@@ -120,13 +122,36 @@ public final class WarmupDriver {
     }
 
     public static byte[] buildHttpFrame(byte[] body) {
-        String head = "POST /fraud-score HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
-            + body.length + "\r\n\r\n";
-        byte[] headBytes = head.getBytes(StandardCharsets.UTF_8);
-        byte[] full = new byte[headBytes.length + body.length];
-        System.arraycopy(headBytes, 0, full, 0, headBytes.length);
-        System.arraycopy(body, 0, full, headBytes.length, body.length);
+        int digits = decimalDigits(body.length);
+        byte[] full = new byte[HTTP_FRAME_PREFIX.length + digits + HTTP_FRAME_SUFFIX.length + body.length];
+        int p = 0;
+        System.arraycopy(HTTP_FRAME_PREFIX, 0, full, p, HTTP_FRAME_PREFIX.length);
+        p += HTTP_FRAME_PREFIX.length;
+        writeDecimal(full, p, body.length, digits);
+        p += digits;
+        System.arraycopy(HTTP_FRAME_SUFFIX, 0, full, p, HTTP_FRAME_SUFFIX.length);
+        p += HTTP_FRAME_SUFFIX.length;
+        System.arraycopy(body, 0, full, p, body.length);
         return full;
+    }
+
+    private static int decimalDigits(int v) {
+        if (v >= 100_000_000) return v >= 1_000_000_000 ? 10 : 9;
+        if (v >= 1_000_000) return v >= 10_000_000 ? 8 : 7;
+        if (v >= 10_000) return v >= 100_000 ? 6 : 5;
+        if (v >= 1000) return 4;
+        if (v >= 100) return 3;
+        if (v >= 10) return 2;
+        return 1;
+    }
+
+    private static void writeDecimal(byte[] out, int offset, int value, int digits) {
+        int p = offset + digits;
+        int v = value;
+        do {
+            out[--p] = (byte) ('0' + (v % 10));
+            v /= 10;
+        } while (p > offset);
     }
 
     private int warmSearch(long deadlineNanos) {
@@ -237,7 +262,7 @@ public final class WarmupDriver {
 
             String body = String.format(
                 "{\"id\":\"tx-warmup-%04d\","
-                + "\"transaction\":{\"amount\":%.2f,\"installments\":%d,\"requested_at\":\"2026-03-11T%02d:23:35Z\"},"
+                + "\"transaction\":{\"amount\":%.2f,\"installments\":%d,\"requested_at\":\"2026-01-15T%02d:23:35Z\"},"
                 + "\"customer\":{\"avg_amount\":%.2f,\"tx_count_24h\":%d,\"known_merchants\":%s},"
                 + "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"%s\",\"avg_amount\":%.2f},"
                 + "\"terminal\":{\"is_online\":%b,\"card_present\":%b,\"km_from_home\":%.4f},"
@@ -247,7 +272,7 @@ public final class WarmupDriver {
                 mcc, merchantAvg,
                 online, cardPresent, kmFromHome,
                 hasLastTx
-                    ? String.format("{\"timestamp\":\"2026-03-11T%02d:58:35Z\",\"km_from_current\":%.4f}", (hour + 23) % 24, kmFromCurrent)
+                    ? String.format("{\"timestamp\":\"2026-01-15T%02d:58:35Z\",\"km_from_current\":%.4f}", (hour + 23) % 24, kmFromCurrent)
                     : "null"
             );
             out[idx++] = body.getBytes(StandardCharsets.UTF_8);

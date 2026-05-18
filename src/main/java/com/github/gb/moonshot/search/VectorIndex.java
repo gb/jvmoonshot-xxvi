@@ -19,6 +19,14 @@ public interface VectorIndex {
         return countFraudsInTopK(query, 5);
     }
 
+    /**
+     * Exception-free hot-path variant; defaults to {@link #countFraudsInTop5}.
+     * {@link com.github.gb.moonshot.search.KdTree} overrides this with a zero-catch implementation.
+     */
+    default int countFraudsInTop5Fast(float[] query) {
+        return countFraudsInTop5(query);
+    }
+
     int size();
 
     /**

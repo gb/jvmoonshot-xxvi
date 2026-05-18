@@ -28,6 +28,11 @@ public final class Vectorizer {
     private static final long EPOCH_DAYS_FROM_YEAR_ZERO = 719528L;
     /** Multiply by this to scale to 4-decimal grid; cheaper than div by 10000.0. */
     private static final double INV_TEN_THOUSAND = 1.0 / 10000.0;
+    private static final int DATE_CACHE_SIZE = 64;
+    private static final int DATE_CACHE_MASK = DATE_CACHE_SIZE - 1;
+
+    private final int[] dateKeys = new int[DATE_CACHE_SIZE];
+    private final long[] dateInfo = new long[DATE_CACHE_SIZE];
 
     /**
      * Writes normalized floats into {@code outVector[0..14)}. Caller guarantees {@code outVector.length >=
@@ -44,20 +49,16 @@ public final class Vectorizer {
             ? (s.amount * INV_AMOUNT_VS_AVG_RATIO) / avgAmount
             : 0.0);
 
-        // Single-pass timestamp parse: extract year/month/day/hour/min once, derive epochDay once, then compute
-        // BOTH the epoch minute (lanes 5/6 delta against lastTimestamp) AND the day-of-week + hour fields.
         int reqOff   = s.requestedAtOffset;
-        int reqYear  = fourDigits(body, reqOff);
-        int reqMonth = twoDigits(body, reqOff + 5);
-        int reqDay   = twoDigits(body, reqOff + 8);
         int reqHour  = twoDigits(body, reqOff + 11);
         int reqMin   = twoDigits(body, reqOff + 14);
-        long reqEpochDay = toEpochDay(reqYear, reqMonth, reqDay);
+        int reqDateKey = dateKey(body, reqOff);
+        long reqDateInfo = dateInfo(reqDateKey);
+        long reqEpochDay = reqDateInfo >> 3;
         long requestedMinute = reqEpochDay * MINUTES_PER_DAY
                              + reqHour * MINUTES_PER_HOUR
                              + reqMin;
-        // % vs Math.floorMod: epochDay is always positive in the valid range, so sign-correct floorMod isn't needed.
-        int dayOfWeek = (int) ((reqEpochDay + 3L) % 7L);
+        int dayOfWeek = (int) (reqDateInfo & 7L);
 
         outVector[3] = round4(reqHour * INV_MAX_HOUR_OF_DAY);
         outVector[4] = round4(dayOfWeek * INV_MAX_DAY_OF_WEEK);
@@ -66,8 +67,14 @@ public final class Vectorizer {
             outVector[5] = -1f;
             outVector[6] = -1f;
         } else {
-            long lastMinute = parseEpochMinuteUtc(body, s.lastTimestampOffset);
-            outVector[5] = clampRound((requestedMinute - lastMinute) * INV_MAX_MINUTES);
+            int lastOff = s.lastTimestampOffset;
+            int lastDateKey = dateKey(body, lastOff);
+            long lastDateInfo = lastDateKey == reqDateKey ? reqDateInfo : dateInfo(lastDateKey);
+            long lastMinute = (lastDateInfo >> 3) * MINUTES_PER_DAY
+                    + twoDigits(body, lastOff + 11) * MINUTES_PER_HOUR
+                    + twoDigits(body, lastOff + 14);
+            long minuteDelta = requestedMinute - lastMinute;
+            outVector[5] = clampRound(minuteDelta * INV_MAX_MINUTES);
             outVector[6] = clampRound(s.lastKmFromCurrent * INV_MAX_KM);
         }
 
@@ -126,15 +133,30 @@ public final class Vectorizer {
         return vector;
     }
 
-    /** Parses contest timestamp shape {@code yyyy-MM-ddTHH:mm:ssZ} into epoch minutes. */
-    private static long parseEpochMinuteUtc(byte[] body, int offset) {
-        int year  = fourDigits(body, offset);
-        int month = twoDigits(body, offset + 5);
-        int day   = twoDigits(body, offset + 8);
+    /**
+     * Returns {@code (epochDay << 3) | dayOfWeek}. The generator emits many requests on the same small set of
+     * calendar dates, so a tiny direct-mapped date cache avoids the division-heavy Gregorian conversion without
+     * assuming any particular month.
+     */
+    private long dateInfo(int key) {
+        int slot = key & DATE_CACHE_MASK;
+        if (dateKeys[slot] == key) return dateInfo[slot];
+
+        int year = key >>> 9;
+        int month = (key >>> 5) & 0xF;
+        int day = key & 0x1F;
         long epochDay = toEpochDay(year, month, day);
-        return epochDay * MINUTES_PER_DAY
-            + twoDigits(body, offset + 11) * MINUTES_PER_HOUR
-            + twoDigits(body, offset + 14);
+        int dayOfWeek = (int) ((epochDay + 3L) % 7L);
+        long info = (epochDay << 3) | dayOfWeek;
+        dateKeys[slot] = key;
+        dateInfo[slot] = info;
+        return info;
+    }
+
+    private static int dateKey(byte[] body, int offset) {
+        return (fourDigits(body, offset) << 9)
+             | (twoDigits(body, offset + 5) << 5)
+             | twoDigits(body, offset + 8);
     }
 
     private static int fourDigits(byte[] body, int offset) {
@@ -149,6 +171,10 @@ public final class Vectorizer {
     }
 
     private static boolean isUnknownMerchant(byte[] body, ScoringRequestScratch s) {
+        if (s.merchantIdCodeValid && s.knownMerchantMaskValid) {
+            int code = s.merchantIdCode;
+            return code >= Long.SIZE || (s.knownMerchantMask & (1L << code)) == 0L;
+        }
         int merchOff = s.merchantIdOffset;
         int merchLen = s.merchantIdLength;
         for (int i = 0; i < s.knownMerchantsCount; i++) {

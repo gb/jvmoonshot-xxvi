@@ -2,7 +2,6 @@ package com.github.gb.moonshot.search;
 
 import java.lang.foreign.MemorySegment;
 import java.nio.MappedByteBuffer;
-import java.util.Arrays;
 
 import static com.github.gb.moonshot.search.KdTreeTuning.*;
 
@@ -109,6 +108,12 @@ public final class KdTree implements VectorIndex {
     final short[] topBbox;
     final int topNodeCount;
 
+    /** Owned scratch for the single-threaded NIO hot path — eliminates the ThreadLocal lookup per query. */
+    private final KdTreeScratch instanceScratch = new KdTreeScratch();
+
+    /** Nodes visited by the last {@link #countFraudsInTop5Fast} call — for {@link com.github.gb.moonshot.bench.PrefetchBench}. */
+    public int lastFastVisits() { return instanceScratch.visits; }
+
     /**
      * Heap-mode constructor.
      *
@@ -172,19 +177,29 @@ public final class KdTree implements VectorIndex {
         return (short) Math.round(v * SCALE);
     }
 
+    private static short quantizeQuery(float v) {
+        if (v <= -1.0f) return (short) (-SCALE);
+        if (v >= 1.0f) return (short) SCALE;
+        return (short) (v * SCALE + 0.5f);
+    }
+
     // -------------------------------------------------------------------------
     // Nav access
     // -------------------------------------------------------------------------
 
     int leftAndDimAt(int treeIdx) {
+        return leftAndDimAtBase(treeIdx * STRIDE);
+    }
+
+    private int leftAndDimAtBase(int base) {
         if (pts != null) {
-            int base = treeIdx * STRIDE + LANE_LEFT_DIM;
-            return (pts[base] & 0xFFFF) | ((pts[base + 1] & 0xFFFF) << 16);
+            int off = base + LANE_LEFT_DIM;
+            return (pts[off] & 0xFFFF) | ((pts[off + 1] & 0xFFFF) << 16);
         }
         // Mmap: two consecutive i16 LE at byte offset = (treeIdx*STRIDE + LANE_LEFT_DIM)*2.
         // Reading a LE int32 there reconstructs leftAndDim directly (both halves are LE i16).
         return KdTreeUnsafe.UNSAFE.getInt(
-                KdTreeUnsafe.ptsBaseAddr + ((long) ((long) treeIdx * STRIDE + LANE_LEFT_DIM)) * 2L);
+                KdTreeUnsafe.ptsBaseAddr + ((long) base + LANE_LEFT_DIM) * 2L);
     }
 
     static int unpackLeft(int leftAndDim) {
@@ -196,13 +211,17 @@ public final class KdTree implements VectorIndex {
     }
 
     int rightAt(int treeIdx) {
+        return rightAtBase(treeIdx * STRIDE);
+    }
+
+    private int rightAtBase(int base) {
         if (pts != null) {
-            int base = treeIdx * STRIDE + LANE_RIGHT;
-            return (pts[base] & 0xFFFF) | ((pts[base + 1] & 0xFFFF) << 16);
+            int off = base + LANE_RIGHT;
+            return (pts[off] & 0xFFFF) | ((pts[off + 1] & 0xFFFF) << 16);
         }
         // Mmap: byte offset = (treeIdx * STRIDE + LANE_RIGHT) * 2 = treeIdx * 40 + 32 (4-byte aligned).
         return KdTreeUnsafe.UNSAFE.getInt(
-                KdTreeUnsafe.ptsBaseAddr + ((long) ((long) treeIdx * STRIDE + LANE_RIGHT)) * 2L);
+                KdTreeUnsafe.ptsBaseAddr + ((long) base + LANE_RIGHT) * 2L);
     }
 
     /**
@@ -239,39 +258,70 @@ public final class KdTree implements VectorIndex {
     /**
      * Read a single i16 dim value from pts (heap or mmap). Used only for near/far split decisions.
      */
-    private short ptAtI16(int treeIdx, int splitDim) {
-        if (pts != null) return pts[treeIdx * STRIDE + splitDim];
+    private short ptAtI16Base(int base, int splitDim) {
+        if (pts != null) return pts[base + splitDim];
         return KdTreeUnsafe.UNSAFE.getShort(
-                KdTreeUnsafe.ptsBaseAddr + ((long) ((long) treeIdx * STRIDE + splitDim)) * 2L);
+                KdTreeUnsafe.ptsBaseAddr + ((long) base + splitDim) * 2L);
     }
 
     /**
      * Squared L2 distance in i16 units, scaled back to f32 by INV_SCALE_SQ.
-     * Overflow proof: max i32 sum = 14 × (20000²) = 5.6B < Long.MAX_VALUE, but fits
-     * in int since 14 × 400M = 5.6B which overflows int (max ~2.1B) — we use long sum.
+     * Overflow proof under the contest spec: only semantic dims 5 and 6 may use the -1 sentinel; all other
+     * dims are clamped to [0, 1]. After quantization the worst squared sum is
+     * 2 × 20000² + 12 × 10000² = 2.0B, below Integer.MAX_VALUE, so int accumulation is safe.
      *
      * <p>Scalar implementation avoids ShortVector → IntVector convertShape, which
      * C2 on x86 JDK 25 fails to escape-analyze, causing ~787 KB heap allocation
      * per query (Vector objects not eliminated). Scalar loop is auto-vectorized
      * by C2 on AVX2 hosts with no allocation.
      */
-    private float distSquaredI16(KdTreeScratch scratch, int treeIdx) {
+    private int distSumI16AtBase(KdTreeScratch scratch, int base) {
         short[] q = scratch.permutedQueryI16;
-        long sum = 0;
+        int sum = 0;
         if (pts != null) {
-            int base = treeIdx * STRIDE;
             for (int d = 0; d < DIMS; d++) {
-                long diff = q[d] - pts[base + d];
+                int diff = q[d] - pts[base + d];
                 sum += diff * diff;
             }
         } else {
-            long nodeBase = KdTreeUnsafe.ptsBaseAddr + (long) treeIdx * (STRIDE * 2L);
-            for (int d = 0; d < DIMS; d++) {
-                long diff = q[d] - KdTreeUnsafe.UNSAFE.getShort(nodeBase + (long) d * 2L);
-                sum += diff * diff;
-            }
+            long nodeBase = KdTreeUnsafe.ptsBaseAddr + (long) base * 2L;
+            long w = KdTreeUnsafe.UNSAFE.getLong(nodeBase);
+            int diff = q[0] - (short) w;
+            sum += diff * diff;
+            diff = q[1] - (short) (w >>> 16);
+            sum += diff * diff;
+            diff = q[2] - (short) (w >>> 32);
+            sum += diff * diff;
+            diff = q[3] - (short) (w >>> 48);
+            sum += diff * diff;
+
+            w = KdTreeUnsafe.UNSAFE.getLong(nodeBase + 8L);
+            diff = q[4] - (short) w;
+            sum += diff * diff;
+            diff = q[5] - (short) (w >>> 16);
+            sum += diff * diff;
+            diff = q[6] - (short) (w >>> 32);
+            sum += diff * diff;
+            diff = q[7] - (short) (w >>> 48);
+            sum += diff * diff;
+
+            w = KdTreeUnsafe.UNSAFE.getLong(nodeBase + 16L);
+            diff = q[8] - (short) w;
+            sum += diff * diff;
+            diff = q[9] - (short) (w >>> 16);
+            sum += diff * diff;
+            diff = q[10] - (short) (w >>> 32);
+            sum += diff * diff;
+            diff = q[11] - (short) (w >>> 48);
+            sum += diff * diff;
+
+            int tail = KdTreeUnsafe.UNSAFE.getInt(nodeBase + 24L);
+            diff = q[12] - (short) tail;
+            sum += diff * diff;
+            diff = q[13] - (short) (tail >>> 16);
+            sum += diff * diff;
         }
-        return sum * INV_SCALE_SQ;
+        return sum;
     }
 
     /**
@@ -282,21 +332,48 @@ public final class KdTree implements VectorIndex {
         int base = slot * STRIDE_BBOX;
         short[] q = scratch.permutedQueryI16;
         short[] bb = topBbox;
-        long partLo = 0;
+        int partLo = 0;
         for (int d = 0; d < 8; d++) {
-            long clamped = Math.max(bb[base + d] - q[d], Math.max(q[d] - bb[base + 16 + d], 0));
+            int clamped = Math.max(bb[base + d] - q[d], Math.max(q[d] - bb[base + 16 + d], 0));
             partLo += clamped * clamped;
         }
         if (scratch.results.size() == TopKSortedArray.MAX_K
                 && partLo * INV_SCALE_SQ >= scratch.results.peekDist()) {
             return Float.POSITIVE_INFINITY;
         }
-        long partHi = 0;
+        int partHi = 0;
         for (int d = 8; d < DIMS; d++) {
-            long clamped = Math.max(bb[base + d] - q[d], Math.max(q[d] - bb[base + 16 + d], 0));
+            int clamped = Math.max(bb[base + d] - q[d], Math.max(q[d] - bb[base + 16 + d], 0));
             partHi += clamped * clamped;
         }
         return (partLo + partHi) * INV_SCALE_SQ;
+    }
+
+    private boolean bboxPrunesI16Sum(KdTreeScratch scratch, int slot, int thresholdSum) {
+        int base = slot * STRIDE_BBOX;
+        short[] q = scratch.permutedQueryI16;
+        short[] bb = topBbox;
+        int partLo = 0;
+        for (int d = 0; d < 8; d++) {
+            int clamped = Math.max(bb[base + d] - q[d], Math.max(q[d] - bb[base + 16 + d], 0));
+            partLo += clamped * clamped;
+        }
+        if (partLo >= thresholdSum) return true;
+        int partHi = 0;
+        for (int d = 8; d < DIMS; d++) {
+            int clamped = Math.max(bb[base + d] - q[d], Math.max(q[d] - bb[base + 16 + d], 0));
+            partHi += clamped * clamped;
+        }
+        return partLo + partHi >= thresholdSum;
+    }
+
+    private static int thresholdSum(int peekSum, int visits, boolean exact) {
+        if (exact || !RELAX_INITIALLY_ENABLED) return peekSum;
+        return Math.max(0, (int) (peekSum * KdTreeTuning.relaxScale(visits)));
+    }
+
+    private static boolean visitBudgetExhausted(KdTreeScratch scratch, boolean exact) {
+        return !exact && MAX_VISITS_ENABLED && scratch.visits >= MAX_VISITS_BUDGET;
     }
 
     // -------------------------------------------------------------------------
@@ -311,12 +388,33 @@ public final class KdTree implements VectorIndex {
     @Override
     public int countFraudsInTop5(float[] query) {
         KdTreeScratch scratch = KdTreeScratch.scratchTL.get();
+        int fraudCount = countFraudsInTop5(query, scratch, false);
+        if ((RELAX_INITIALLY_ENABLED || MAX_VISITS_ENABLED) && REFINE_BOUNDARY
+                && (fraudCount == 2 || fraudCount == 3)) {
+            fraudCount = countFraudsInTop5(query, scratch, true);
+        }
+        return fraudCount;
+    }
+
+    /**
+     * Hot path for the single-threaded NIO event loop: uses the owned {@link #instanceScratch},
+     * avoiding the ThreadLocal lookup on every query.
+     */
+    public int countFraudsInTop5Fast(float[] query) {
+        KdTreeScratch scratch = instanceScratch;
+        int fraudCount = countFraudsInTop5(query, scratch, false);
+        if ((RELAX_INITIALLY_ENABLED || MAX_VISITS_ENABLED) && REFINE_BOUNDARY
+                && (fraudCount == 2 || fraudCount == 3)) {
+            fraudCount = countFraudsInTop5(query, scratch, true);
+        }
+        return fraudCount;
+    }
+
+    private int countFraudsInTop5(float[] query, KdTreeScratch scratch, boolean exact) {
         prepareSearch(query, scratch);
         prime(scratch, TopKSortedArray.MAX_K);
-        descendBBF(scratch, TopKSortedArray.MAX_K);
+        descendBBF(scratch, TopKSortedArray.MAX_K, exact);
         if (PROFILING_ENABLED) scratch.finalPeekDist = scratch.results.peekDist();
-        // Mmap mode: fraud flag is in pts lane 18 (no separate heap array).
-        // Heap mode: read from the fraud[] byte array.
         return ptsSeg != null
                 ? scratch.results.countFraudsFromMmap(KdTreeUnsafe.ptsBaseAddr, STRIDE)
                 : scratch.results.countFrauds(fraud);
@@ -329,7 +427,7 @@ public final class KdTree implements VectorIndex {
         scratch.ensureTopKCapacity(k);
         prepareSearch(query, scratch);
         prime(scratch, k);
-        descendBBF(scratch, k);
+        descendBBF(scratch, k, false);
         if (PROFILING_ENABLED) scratch.finalPeekDist = scratch.results.peekDist();
         int[] treeIdxs = scratch.topKBuf;
         int count = scratch.results.drainAscending(treeIdxs);
@@ -354,7 +452,21 @@ public final class KdTree implements VectorIndex {
 
     static void prepareSearch(float[] query, KdTreeScratch scratch) {
         scratch.results.clear();
-        Arrays.fill(scratch.slab, 0f);
+        int[] slab = scratch.slab;
+        slab[0] = 0;
+        slab[1] = 0;
+        slab[2] = 0;
+        slab[3] = 0;
+        slab[4] = 0;
+        slab[5] = 0;
+        slab[6] = 0;
+        slab[7] = 0;
+        slab[8] = 0;
+        slab[9] = 0;
+        slab[10] = 0;
+        slab[11] = 0;
+        slab[12] = 0;
+        slab[13] = 0;
         scratch.visits = 0;
         scratch.bboxChecks = 0;
         scratch.bbfSize = 0;
@@ -369,10 +481,21 @@ public final class KdTree implements VectorIndex {
             scratch.finalPeekDist = 0f;
         }
         short[] pqi = scratch.permutedQueryI16;
-        int[] perm = DIM_PERMUTATION;
-        for (int i = 0; i < DIMS; i++) {
-            pqi[i] = quantize(query[perm[i]]);
-        }
+        // Keep this unrolled order in sync with KdTreeLayout.DIM_PERMUTATION.
+        pqi[0] = quantizeQuery(query[6]);
+        pqi[1] = quantizeQuery(query[10]);
+        pqi[2] = quantizeQuery(query[9]);
+        pqi[3] = quantizeQuery(query[5]);
+        pqi[4] = quantizeQuery(query[11]);
+        pqi[5] = quantizeQuery(query[2]);
+        pqi[6] = quantizeQuery(query[4]);
+        pqi[7] = quantizeQuery(query[7]);
+        pqi[8] = quantizeQuery(query[0]);
+        pqi[9] = quantizeQuery(query[1]);
+        pqi[10] = quantizeQuery(query[3]);
+        pqi[11] = quantizeQuery(query[8]);
+        pqi[12] = quantizeQuery(query[12]);
+        pqi[13] = quantizeQuery(query[13]);
         pqi[LANE_LEFT_DIM] = 0;
         pqi[LANE_RIGHT] = 0;
     }
@@ -391,23 +514,24 @@ public final class KdTree implements VectorIndex {
         if (treeIdx < 0) return;
         TopKSortedArray topK = scratch.results;
         scratch.visits++;
-        float dist = distSquaredI16(scratch, treeIdx);
+        int nodeBase = treeIdx * STRIDE;
+        int dist = distSumI16AtBase(scratch, nodeBase);
         if (topK.size() < k) {
             topK.push(treeIdx, dist);
             if (PROFILING_ENABLED && topK.size() == k) scratch.topKFilledAt = scratch.visits;
-        } else if (dist < topK.peekDist()) {
+        } else if (dist < topK.peekSum()) {
             topK.replaceFarthest(treeIdx, dist);
             if (PROFILING_ENABLED) scratch.topKReplaced++;
         }
-        int leftAndDim = leftAndDimAt(treeIdx);
+        int leftAndDim = leftAndDimAtBase(nodeBase);
         int leftIdx = unpackLeft(leftAndDim);
-        int rightIdx = rightAt(treeIdx);
+        int rightIdx = rightAtBase(nodeBase);
         if (depth < PRIME_FANOUT_DEPTH) {
             primeRecurse(leftIdx, scratch, k, depth + 1);
             primeRecurse(rightIdx, scratch, k, depth + 1);
         } else {
             int splitDim = unpackDim(leftAndDim);
-            int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16(treeIdx, splitDim);
+            int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16Base(nodeBase, splitDim);
             int near = (delta_i16 < 0) ? leftIdx : rightIdx;
             if (near >= 0 && scratch.fanOutCount < PRIME_FANOUT_COUNT) {
                 scratch.fanOutBuf[scratch.fanOutCount++] = near;
@@ -456,19 +580,20 @@ public final class KdTree implements VectorIndex {
         TopKSortedArray topK = scratch.results;
         while (treeIdx >= 0) {
             scratch.visits++;
-            float dist = distSquaredI16(scratch, treeIdx);
+            int nodeBase = treeIdx * STRIDE;
+            int dist = distSumI16AtBase(scratch, nodeBase);
             if (topK.size() < k) {
                 topK.push(treeIdx, dist);
                 if (PROFILING_ENABLED && topK.size() == k) scratch.topKFilledAt = scratch.visits;
-            } else if (dist < topK.peekDist()) {
+            } else if (dist < topK.peekSum()) {
                 topK.replaceFarthest(treeIdx, dist);
                 if (PROFILING_ENABLED) scratch.topKReplaced++;
             }
-            int leftAndDim = leftAndDimAt(treeIdx);
+            int leftAndDim = leftAndDimAtBase(nodeBase);
             int splitDim = unpackDim(leftAndDim);
             int leftIdx = unpackLeft(leftAndDim);
-            int rightIdx = rightAt(treeIdx);
-            int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16(treeIdx, splitDim);
+            int rightIdx = rightAtBase(nodeBase);
+            int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16Base(nodeBase, splitDim);
             treeIdx = (delta_i16 < 0) ? leftIdx : rightIdx;
         }
     }
@@ -477,13 +602,14 @@ public final class KdTree implements VectorIndex {
     // Descend — classical DFS fallback for deep FAR nodes
     // -------------------------------------------------------------------------
 
-    void descend(int treeIdx, KdTreeScratch scratch, int k, float slabSum, int depth) {
+    void descend(int treeIdx, KdTreeScratch scratch, int k, int slabSum, int depth, boolean exact) {
         if (treeIdx < 0) return;
-        if (MAX_VISITS_ENABLED && scratch.visits >= MAX_VISITS_BUDGET) return;
+        if (visitBudgetExhausted(scratch, exact)) return;
         TopKSortedArray topK = scratch.results;
         if (topK.size() >= k) {
-            float thresh = topK.peekDist() * relaxScale(scratch.visits);
-            if (slabSum >= thresh) {
+            int peekSum = topK.peekSum();
+            int threshSum = thresholdSum(peekSum, scratch.visits, exact);
+            if (slabSum > threshSum) {
                 if (PROFILING_ENABLED) scratch.slabPrunes++;
                 return;
             }
@@ -491,7 +617,7 @@ public final class KdTree implements VectorIndex {
                 int slot = topSlot[treeIdx];
                 if (slot >= 0) {
                     scratch.bboxChecks++;
-                    if (bboxDistSquaredI16(scratch, slot) >= thresh) {
+                    if (bboxPrunesI16Sum(scratch, slot, threshSum)) {
                         if (PROFILING_ENABLED) scratch.bboxPrunes++;
                         return;
                     }
@@ -499,21 +625,22 @@ public final class KdTree implements VectorIndex {
             }
         }
         scratch.visits++;
-        float dist = distSquaredI16(scratch, treeIdx);
+        int nodeBase = treeIdx * STRIDE;
+        int dist = distSumI16AtBase(scratch, nodeBase);
         if (topK.size() < k) {
             if (!topK.contains(treeIdx)) {
                 topK.push(treeIdx, dist);
                 if (PROFILING_ENABLED && topK.size() == k) scratch.topKFilledAt = scratch.visits;
             }
-        } else if (dist < topK.peekDist() && !topK.contains(treeIdx)) {
+        } else if (dist < topK.peekSum() && !topK.contains(treeIdx)) {
             topK.replaceFarthest(treeIdx, dist);
             if (PROFILING_ENABLED) scratch.topKReplaced++;
         }
-        int leftAndDim = leftAndDimAt(treeIdx);
+        int leftAndDim = leftAndDimAtBase(nodeBase);
         int splitDim = unpackDim(leftAndDim);
         int leftIdx = unpackLeft(leftAndDim);
-        int rightIdx = rightAt(treeIdx);
-        int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16(treeIdx, splitDim);
+        int rightIdx = rightAtBase(nodeBase);
+        int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16Base(nodeBase, splitDim);
         int near, far;
         if (delta_i16 < 0) {
             near = leftIdx;
@@ -523,15 +650,15 @@ public final class KdTree implements VectorIndex {
             far = leftIdx;
         }
 
-        descend(near, scratch, k, slabSum, depth + 1);
+        descend(near, scratch, k, slabSum, depth + 1, exact);
 
-        float[] slab = scratch.slab;
-        float oldSlabD = slab[splitDim];
-        float newSlabD = delta_i16 * delta_i16 * INV_SCALE_SQ;
-        float newSlabSum = slabSum - oldSlabD + newSlabD;
-        if (topK.size() < k || newSlabSum < topK.peekDist() * relaxScale(scratch.visits)) {
+        int[] slab = scratch.slab;
+        int oldSlabD = slab[splitDim];
+        int newSlabD = delta_i16 * delta_i16;
+        int newSlabSum = slabSum - oldSlabD + newSlabD;
+        if (topK.size() < k || newSlabSum <= thresholdSum(topK.peekSum(), scratch.visits, exact)) {
             slab[splitDim] = newSlabD;
-            descend(far, scratch, k, newSlabSum, depth + 1);
+            descend(far, scratch, k, newSlabSum, depth + 1, exact);
             slab[splitDim] = oldSlabD;
         }
     }
@@ -540,23 +667,24 @@ public final class KdTree implements VectorIndex {
     // Best-first BBF
     // -------------------------------------------------------------------------
 
-    void descendBBF(KdTreeScratch scratch, int k) {
-        continueDfsBBF(0, 0f, 0, scratch, k);
+    void descendBBF(KdTreeScratch scratch, int k, boolean exact) {
+        continueDfsBBF(0, 0, 0, scratch, k, exact);
         int[] hTreeIdx = scratch.bbfTreeIdx;
-        float[] hSlabSum = scratch.bbfSlabSum;
+        int[] hSlabSum = scratch.bbfSlabSum;
         int[] hDepth = scratch.bbfDepth;
         int[] hSlabIdx = scratch.bbfSlabIdx;
-        float[] pool = scratch.bbfSlabPool;
+        int[] pool = scratch.bbfSlabPool;
         TopKSortedArray topK = scratch.results;
         while (scratch.bbfSize > 0) {
+            if (visitBudgetExhausted(scratch, exact)) break;
             int popTi = hTreeIdx[0];
-            float popSs = hSlabSum[0];
+            int popSs = hSlabSum[0];
             int popDe = hDepth[0];
             int popSi = hSlabIdx[0];
             int lastIdx = --scratch.bbfSize;
             if (lastIdx > 0) {
                 int ti = hTreeIdx[lastIdx];
-                float ss = hSlabSum[lastIdx];
+                int ss = hSlabSum[lastIdx];
                 int de = hDepth[lastIdx];
                 int si = hSlabIdx[lastIdx];
                 int i = 0, half = lastIdx >>> 1;
@@ -576,51 +704,66 @@ public final class KdTree implements VectorIndex {
                 hDepth[i] = de;
                 hSlabIdx[i] = si;
             }
-            if (topK.size() >= k && popSs >= topK.peekDist()) continue;
+            if (topK.size() >= k && popSs > thresholdSum(topK.peekSum(), scratch.visits, exact)) continue;
             System.arraycopy(pool, popSi * DIMS, scratch.slab, 0, DIMS);
-            continueDfsBBF(popTi, popSs, popDe, scratch, k);
+            continueDfsBBF(popTi, popSs, popDe, scratch, k, exact);
         }
     }
 
-    private void continueDfsBBF(int treeIdx, float slabSum, int depth, KdTreeScratch scratch, int k) {
+    private void continueDfsBBF(int treeIdx, int slabSum, int depth, KdTreeScratch scratch, int k,
+                                boolean exact) {
         TopKSortedArray topK = scratch.results;
-        float[] slab = scratch.slab;
+        int[] slab = scratch.slab;
         int[] hTreeIdx = scratch.bbfTreeIdx;
-        float[] hSlabSum = scratch.bbfSlabSum;
+        int[] hSlabSum = scratch.bbfSlabSum;
         int[] hDepth = scratch.bbfDepth;
         int[] hSlabIdx = scratch.bbfSlabIdx;
-        float[] pool = scratch.bbfSlabPool;
+        int[] pool = scratch.bbfSlabPool;
         while (treeIdx >= 0) {
-            if (topK.size() >= k && slabSum >= topK.peekDist()) {
-                if (PROFILING_ENABLED) scratch.slabPrunes++;
-                return;
+            if (visitBudgetExhausted(scratch, exact)) return;
+            boolean full = topK.size() >= k;
+            int peekSum = full ? topK.peekSum() : Integer.MAX_VALUE;
+            int thresholdSum = full ? thresholdSum(peekSum, scratch.visits, exact) : Integer.MAX_VALUE;
+            if (full) {
+                if (slabSum > thresholdSum) {
+                    if (PROFILING_ENABLED) scratch.slabPrunes++;
+                    return;
+                }
             }
-            if (depth <= TOP_BBOX_DEPTH && topK.size() >= k) {
+            if (depth <= TOP_BBOX_DEPTH && full) {
                 int slot = topSlot[treeIdx];
                 if (slot >= 0) {
                     scratch.bboxChecks++;
-                    if (bboxDistSquaredI16(scratch, slot) >= topK.peekDist()) {
+                    if (bboxPrunesI16Sum(scratch, slot, thresholdSum)) {
                         if (PROFILING_ENABLED) scratch.bboxPrunes++;
                         return;
                     }
                 }
             }
             scratch.visits++;
-            float dist = distSquaredI16(scratch, treeIdx);
-            if (topK.size() < k) {
+            int nodeBase = treeIdx * STRIDE;
+            int dist = distSumI16AtBase(scratch, nodeBase);
+            if (!full) {
                 if (!topK.contains(treeIdx)) {
                     topK.push(treeIdx, dist);
                     if (PROFILING_ENABLED && topK.size() == k) scratch.topKFilledAt = scratch.visits;
+                    full = topK.size() >= k;
+                    if (full) {
+                        peekSum = topK.peekSum();
+                        thresholdSum = thresholdSum(peekSum, scratch.visits, exact);
+                    }
                 }
-            } else if (dist < topK.peekDist() && !topK.contains(treeIdx)) {
+            } else if (dist < peekSum && !topK.contains(treeIdx)) {
                 topK.replaceFarthest(treeIdx, dist);
+                peekSum = topK.peekSum();
+                thresholdSum = thresholdSum(peekSum, scratch.visits, exact);
                 if (PROFILING_ENABLED) scratch.topKReplaced++;
             }
-            int leftAndDim = leftAndDimAt(treeIdx);
+            int leftAndDim = leftAndDimAtBase(nodeBase);
             int splitDim = unpackDim(leftAndDim);
             int leftIdx = unpackLeft(leftAndDim);
-            int rightIdx = rightAt(treeIdx);
-            int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16(treeIdx, splitDim);
+            int rightIdx = rightAtBase(nodeBase);
+            int delta_i16 = scratch.permutedQueryI16[splitDim] - ptAtI16Base(nodeBase, splitDim);
             int near, far;
             if (delta_i16 < 0) {
                 near = leftIdx;
@@ -631,10 +774,10 @@ public final class KdTree implements VectorIndex {
             }
 
             if (far >= 0) {
-                float oldSlabD = slab[splitDim];
-                float newSlabD = delta_i16 * delta_i16 * INV_SCALE_SQ;
-                float newSlabSum = slabSum - oldSlabD + newSlabD;
-                if (topK.size() < k || newSlabSum < topK.peekDist()) {
+                int oldSlabD = slab[splitDim];
+                int newSlabD = delta_i16 * delta_i16;
+                int newSlabSum = slabSum - oldSlabD + newSlabD;
+                if (!full || newSlabSum <= thresholdSum) {
                     int nextDepth = depth + 1;
                     if (nextDepth <= BBF_MAX_DEPTH && scratch.bbfSize < KdTreeScratch.BBF_HEAP_CAP
                             && scratch.bbfSlabNext < KdTreeScratch.BBF_POOL_CAP) {
@@ -662,7 +805,7 @@ public final class KdTree implements VectorIndex {
                         hSlabIdx[i] = newSlabIdx;
                     } else {
                         slab[splitDim] = newSlabD;
-                        descend(far, scratch, k, newSlabSum, nextDepth);
+                        descend(far, scratch, k, newSlabSum, nextDepth, exact);
                         slab[splitDim] = oldSlabD;
                     }
                 }

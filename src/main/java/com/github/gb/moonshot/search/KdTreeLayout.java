@@ -23,7 +23,7 @@ public final class KdTreeLayout {
     /**
      * Variance-descending lane order. Drives split-dim tie-breaking toward the highest-variance
      * dimension, yielding a more balanced tree and fewer visits per query. Tuned offline via
-     * {@code DimPermTuner}; do not change without a full sweep.
+     * {@code DimPermTuner} against vectorized transaction payload banks.
      */
     public static final int[] DIM_PERMUTATION = {6, 10, 9, 5, 11, 2, 4, 7, 0, 1, 3, 8, 12, 13};
 

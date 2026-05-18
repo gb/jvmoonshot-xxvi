@@ -6,7 +6,7 @@ final class KdTreeScratch {
     static final ThreadLocal<KdTreeScratch> scratchTL = ThreadLocal.withInitial(KdTreeScratch::new);
 
     final TopKSortedArray results         = new TopKSortedArray();
-    final float[]         slab            = new float[KdTree.DIMS];
+    final int[]           slab            = new int[KdTree.DIMS];
     /** Lanes 14-15 stay zero; permuted query in i16 units. */
     final short[]         permutedQueryI16 = new short[KdTree.STRIDE];
     int[] topKBuf                          = new int[8];
@@ -34,10 +34,10 @@ final class KdTreeScratch {
      */
     static final int BBF_POOL_CAP = 256;
     final int[]   bbfTreeIdx  = new int[BBF_HEAP_CAP];
-    final float[] bbfSlabSum  = new float[BBF_HEAP_CAP];
+    final int[]   bbfSlabSum  = new int[BBF_HEAP_CAP];
     final int[]   bbfDepth    = new int[BBF_HEAP_CAP];
     final int[]   bbfSlabIdx  = new int[BBF_HEAP_CAP];
-    final float[] bbfSlabPool = new float[BBF_POOL_CAP * KdTree.DIMS];
+    final int[]   bbfSlabPool = new int[BBF_POOL_CAP * KdTree.DIMS];
     int bbfSize;
     int bbfSlabNext;
 

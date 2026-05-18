@@ -39,7 +39,17 @@ final class HttpConnection {
     final ByteBuffer readBuf = ByteBuffer.allocate(READ_BUF_SIZE);
     // Direct write buffer avoids the JDK's per-write heap-to-native staging copy on SocketChannel.write().
     // Responses are tiny but p99 is hypersensitive to extra memcpy/JNI staging on the single IO thread.
-    final ByteBuffer writeBuf = ByteBuffer.allocateDirect(WRITE_BUF_SIZE);
+    final ByteBuffer writeBuf = initWriteBuf();
+
+    private static ByteBuffer initWriteBuf() {
+        ByteBuffer b = ByteBuffer.allocateDirect(WRITE_BUF_SIZE);
+        // Touch the page immediately so the OS backs it now rather than on the first
+        // channel.write() call per connection. allocateDirect maps anonymous pages that
+        // are copy-on-write zero; without this touch the first write causes a minor page
+        // fault on the hot IO thread.
+        b.put(0, (byte) 0);
+        return b;
+    }
 
     int routeId = Router.ROUTE_NOT_FOUND;
     int bodyStart = -1;

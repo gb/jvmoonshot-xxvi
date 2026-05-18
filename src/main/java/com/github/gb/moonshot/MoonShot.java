@@ -16,7 +16,6 @@ import java.net.SocketAddress;
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -33,27 +32,31 @@ import java.util.Objects;
 public final class MoonShot {
 
     public static void main(String[] args) throws Exception {
+        clearReadyFile();
         VectorIndex index = loadIndex();
         ScoringRequestParser parser = new ScoringRequestParser();
         Vectorizer vectorizer = new Vectorizer();
         Router router = new Router(new FraudScoreHandler(parser, vectorizer, index));
 
-        new WarmupDriver(index, parser, vectorizer, router).run();
+        byte[][] warmupBodies = WarmupDriver.loadBodies();
+        new WarmupDriver(index, parser, vectorizer, router).run(warmupBodies);
+        byte[][] warmupFrames = buildHttpFrames(warmupBodies);
         SocketAddress addr = listenAddress();
         NioHttpServer nioServer = new NioHttpServer();
         nioServer.start(addr, router);
 
         preinitAotClasses();
-        runLiveListenerPump(addr);
+        runLiveListenerPump(addr, warmupFrames);
         String fdSocket = startFdReceiver(nioServer);
 
         if (aotTrainingMode()) {
-            runFdPassingPump(fdSocket);
+            runFdPassingPump(fdSocket, warmupFrames);
             log("AOT_TRAINING=1 exiting after live-listener and FD-passing pumps");
             System.exit(0);
         }
 
         router.markReady();
+        writeReadyFile();
         log("listening on " + addr);
     }
 
@@ -83,29 +86,33 @@ public final class MoonShot {
      * 15 000 sequential cycles clear C2's tier-4 threshold for every per-request method; 100 channels matches the
      * contest k6's 100-VU concurrency so accept-side state is exercised at the right cardinality.
      */
-    private static void runLiveListenerPump(SocketAddress addr) {
+    private static void runLiveListenerPump(SocketAddress addr, byte[][] frames) {
         int iters = Integer.parseInt(env("LIVE_WARMUP_ITERS", "15000"));
         int connections = Integer.parseInt(env("LIVE_WARMUP_CONNECTIONS", "100"));
         long deadlineNanos = System.nanoTime() + 10_000L * 1_000_000L;
-        byte[][] bodies = WarmupDriver.loadBodies();
-        byte[][] frames = Arrays.stream(bodies).map(WarmupDriver::buildHttpFrame).toArray(byte[][]::new);
 
         long t0 = System.nanoTime();
         int done = NioAotTraining.trainLiveListener(addr, frames, iters, deadlineNanos, connections);
         log("live-listener pump: " + done + " requests in " + millisSince(t0) + " ms");
     }
 
-    private static void runFdPassingPump(String fdSocket) {
+    private static void runFdPassingPump(String fdSocket, byte[][] frames) {
         if (fdSocket.isEmpty()) return;
         int iters = Integer.parseInt(env("FD_WARMUP_ITERS", env("LIVE_WARMUP_ITERS", "15000")));
         int connections = Integer.parseInt(env("FD_WARMUP_CONNECTIONS", env("LIVE_WARMUP_CONNECTIONS", "100")));
         long deadlineNanos = System.nanoTime() + 10_000L * 1_000_000L;
-        byte[][] bodies = WarmupDriver.loadBodies();
-        byte[][] frames = Arrays.stream(bodies).map(WarmupDriver::buildHttpFrame).toArray(byte[][]::new);
 
         long t0 = System.nanoTime();
         int done = NioAotTraining.trainFdPassing(fdSocket, frames, iters, deadlineNanos, connections);
         log("FD-passing pump: " + done + " requests in " + millisSince(t0) + " ms");
+    }
+
+    private static byte[][] buildHttpFrames(byte[][] bodies) {
+        byte[][] frames = new byte[bodies.length][];
+        for (int i = 0; i < bodies.length; i++) {
+            frames[i] = WarmupDriver.buildHttpFrame(bodies[i]);
+        }
+        return frames;
     }
 
     private static SocketAddress listenAddress() throws Exception {
@@ -123,7 +130,11 @@ public final class MoonShot {
         String kind = env("INDEX_KIND", "kdtree-i16");
         return switch (kind) {
             case "kdtree-i16" -> loadKdTreeIndex(Path.of(env("KDTREE_GRAPH", "data/kdtree-i16.bin")));
-            default -> throw new IllegalArgumentException("INDEX_KIND must be kdtree-i16, got: " + kind);
+            case "stub" -> {
+                log("INDEX_KIND=stub: no dataset load, fixed fraud count=2 (HTTP transport bench mode)");
+                yield new com.github.gb.moonshot.search.StubVectorIndex();
+            }
+            default -> throw new IllegalArgumentException("INDEX_KIND must be kdtree-i16|stub, got: " + kind);
         };
     }
 
@@ -141,6 +152,20 @@ public final class MoonShot {
 
     private static boolean aotTrainingMode() {
         return "1".equals(env("AOT_TRAINING", ""));
+    }
+
+    private static void clearReadyFile() throws IOException {
+        String readyFile = env("READY_FILE", "");
+        if (!readyFile.isEmpty()) {
+            Files.deleteIfExists(Path.of(readyFile));
+        }
+    }
+
+    private static void writeReadyFile() throws IOException {
+        String readyFile = env("READY_FILE", "");
+        if (!readyFile.isEmpty()) {
+            Files.writeString(Path.of(readyFile), "ready");
+        }
     }
 
     private static String env(String key, String fallback) {

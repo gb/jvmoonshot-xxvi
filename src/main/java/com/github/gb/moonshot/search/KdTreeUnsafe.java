@@ -10,6 +10,11 @@ import java.lang.reflect.Field;
  * leftAndDim is packed as two consecutive i16 shorts at pts byte-offset
  * {@code (treeIdx*STRIDE + LANE_LEFT_DIM)*2}. Reading a LE int32 at that offset
  * reconstructs leftAndDim directly (same byte order).
+ *
+ * <p>Software prefetch ({@code PREFETCHT0}) was investigated via {@code jdk.internal.misc.Unsafe.prefetchRead0}
+ * but that method was removed in JDK 25. JNI/Panama downcall alternatives are not C2-intrinsified,
+ * so their call overhead (~20-50 ns) exceeds the prefetch benefit. Prefetch sites remain in
+ * {@link com.github.gb.moonshot.bench.PrefetchBench} as documentation.
  */
 public final class KdTreeUnsafe {
 
