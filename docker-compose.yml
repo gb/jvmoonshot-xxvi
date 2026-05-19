@@ -18,11 +18,15 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+    mem_limit: "10m"
+    memswap_limit: "10m"
+    pids_limit: 32
     deploy:
       resources:
         limits:
           cpus: "0.10"
           memory: "10M"
+          pids: 32
 
   api1:
     image: ghcr.io/gb/jvmoonshot-xxvi:v22
