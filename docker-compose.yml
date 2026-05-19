@@ -1,5 +1,5 @@
 services:
-  lapada:
+  lb:
     image: ghcr.io/gb/lapada:v16
     platform: linux/amd64
     container_name: rinha-lb
