@@ -56,11 +56,15 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+    mem_limit: "160m"
+    memswap_limit: "160m"
+    pids_limit: 200
     deploy:
       resources:
         limits:
           cpus: "0.42"
           memory: "160M"
+          pids: 200
 
   api2:
     image: ghcr.io/gb/jvmoonshot-xxvi:v22
@@ -90,11 +94,15 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+    mem_limit: "160m"
+    memswap_limit: "160m"
+    pids_limit: 200
     deploy:
       resources:
         limits:
           cpus: "0.42"
           memory: "160M"
+          pids: 200
 
 volumes:
   sockets:
