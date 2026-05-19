@@ -36,7 +36,7 @@ services:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
       READY_FILE: /sockets/api1.ready
-      KDTREE_EARLY_DIST_MILLI: "155"
+      KDTREE_EARLY_DIST_MILLI: "161"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
       KDTREE_RELAX_SOFT_CAP: "900"
@@ -74,7 +74,7 @@ services:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
       READY_FILE: /sockets/api2.ready
-      KDTREE_EARLY_DIST_MILLI: "155"
+      KDTREE_EARLY_DIST_MILLI: "161"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
       KDTREE_RELAX_SOFT_CAP: "900"
