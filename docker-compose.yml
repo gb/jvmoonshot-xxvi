@@ -23,7 +23,7 @@ x-api: &api
 
 services:
   lb:
-    image: ghcr.io/gb/lapada:v18
+    image: ghcr.io/gb/lapada:v19
     platform: linux/amd64
     container_name: rinha-lb
     ports:
