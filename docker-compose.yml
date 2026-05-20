@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/gb/lapada:v16
+    image: ghcr.io/gb/lapada:v17
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -21,11 +21,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.13"
-          memory: "13M"
+          cpus: "0.10"
+          memory: "16M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v22
+    image: ghcr.io/gb/jvmoonshot-xxvi:v23
     platform: linux/amd64
     container_name: rinha-api1
     environment:
@@ -38,7 +38,6 @@ services:
       KDTREE_RELAX_SOFT_CAP: "900"
       KDTREE_RELAX_RANGE: "700"
       KDTREE_RELAX_EPSILON: "0"
-      FRAUD_CACHE_BITS: "0"
     volumes:
       - sockets:/sockets
     healthcheck:
@@ -55,11 +54,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.435"
-          memory: "168M"
+          cpus: "0.45"
+          memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v22
+    image: ghcr.io/gb/jvmoonshot-xxvi:v23
     platform: linux/amd64
     container_name: rinha-api2
     environment:
@@ -72,7 +71,6 @@ services:
       KDTREE_RELAX_SOFT_CAP: "900"
       KDTREE_RELAX_RANGE: "700"
       KDTREE_RELAX_EPSILON: "0"
-      FRAUD_CACHE_BITS: "0"
     volumes:
       - sockets:/sockets
     healthcheck:
@@ -89,8 +87,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.435"
-          memory: "168M"
+          cpus: "0.45"
+          memory: "167M"
 
 volumes:
   sockets:
