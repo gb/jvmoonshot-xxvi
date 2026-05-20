@@ -1,11 +1,11 @@
 x-api: &api
-  image: ghcr.io/gb/jvmoonshot-xxvi:v25
+  image: ghcr.io/gb/jvmoonshot-xxvi:v26
   platform: linux/amd64
   environment: &api-env
     KDTREE_EARLY_DIST_MILLI: "161"
     KDTREE_REFINE_BOUNDARY: "1"
     KDTREE_PRIME_PLUNGE_CAP: "1"
-    KDTREE_PRIME_BBOX: "1"
+    KDTREE_PRIME_BBOX: "0"
     KDTREE_RELAX_SOFT_CAP: "900"
     KDTREE_RELAX_RANGE: "700"
     KDTREE_RELAX_EPSILON: "0"
