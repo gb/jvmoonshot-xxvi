@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/gb/lapada:v17
+    image: ghcr.io/gb/lapada:v18
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -10,10 +10,8 @@ services:
     volumes:
       - sockets:/sockets
     depends_on:
-      api1:
-        condition: service_healthy
-      api2:
-        condition: service_healthy
+      - api1
+      - api2
     ulimits:
       nofile:
         soft: 65535
@@ -25,13 +23,12 @@ services:
           memory: "16M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v23
+    image: ghcr.io/gb/jvmoonshot-xxvi:v24
     platform: linux/amd64
     container_name: rinha-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
-      READY_FILE: /sockets/api1.ready
       KDTREE_EARLY_DIST_MILLI: "161"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
@@ -40,13 +37,6 @@ services:
       KDTREE_RELAX_EPSILON: "0"
     volumes:
       - sockets:/sockets
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /sockets/api1.ready && test -S /sockets/api1-fd.sock"]
-      interval: 60s
-      timeout: 1s
-      retries: 30
-      start_period: 60s
-      start_interval: 1s
     ulimits:
       nofile:
         soft: 65535
@@ -58,13 +48,12 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:v23
+    image: ghcr.io/gb/jvmoonshot-xxvi:v24
     platform: linux/amd64
     container_name: rinha-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
-      READY_FILE: /sockets/api2.ready
       KDTREE_EARLY_DIST_MILLI: "161"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
@@ -73,13 +62,6 @@ services:
       KDTREE_RELAX_EPSILON: "0"
     volumes:
       - sockets:/sockets
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /sockets/api2.ready && test -S /sockets/api2-fd.sock"]
-      interval: 60s
-      timeout: 1s
-      retries: 30
-      start_period: 60s
-      start_interval: 1s
     ulimits:
       nofile:
         soft: 65535
