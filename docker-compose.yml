@@ -1,14 +1,6 @@
 x-api: &api
-  image: ghcr.io/gb/jvmoonshot-xxvi:v30
+  image: ghcr.io/gb/jvmoonshot-xxvi:v32
   platform: linux/amd64
-  environment: &api-env
-    KDTREE_EARLY_DIST_MILLI: "161"
-    KDTREE_REFINE_BOUNDARY: "1"
-    KDTREE_PRIME_PLUNGE_CAP: "1"
-    KDTREE_PRIME_BBOX: "0"
-    KDTREE_RELAX_SOFT_CAP: "900"
-    KDTREE_RELAX_RANGE: "700"
-    KDTREE_RELAX_EPSILON: "0"
   volumes:
     - sockets:/sockets
   ulimits:
@@ -28,8 +20,6 @@ services:
     container_name: rinha-lb
     ports:
       - "9999:9999"
-    environment:
-      FD_UPSTREAMS: "/sockets/api1-fd.sock,/sockets/api2-fd.sock"
     volumes:
       - sockets:/sockets
     depends_on:
@@ -49,17 +39,13 @@ services:
     <<: *api
     container_name: rinha-api1
     environment:
-      <<: *api-env
       LISTEN_SOCKET: /sockets/api1.sock
-      FD_SOCKET: /sockets/api1-fd.sock
 
   api2:
     <<: *api
     container_name: rinha-api2
     environment:
-      <<: *api-env
       LISTEN_SOCKET: /sockets/api2.sock
-      FD_SOCKET: /sockets/api2-fd.sock
 
 volumes:
   sockets:
