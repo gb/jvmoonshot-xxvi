@@ -1,21 +1,6 @@
-x-api: &api
-  image: ghcr.io/gb/jvmoonshot-xxvi:v33
-  platform: linux/amd64
-  volumes:
-    - sockets:/sockets
-  ulimits:
-    nofile:
-      soft: 65535
-      hard: 65535
-  deploy:
-    resources:
-      limits:
-        cpus: "0.45"
-        memory: "167M"
-
 services:
-  lb:
-    image: ghcr.io/gb/lapada:v20
+  lapada:
+    image: ghcr.io/gb/lapada:1.0.0
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -27,6 +12,13 @@ services:
     depends_on:
       - api1
       - api2
+    sysctls:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 4096
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 10
+      net.ipv4.ip_local_port_range: "15000 64000"
+      net.ipv6.conf.all.disable_ipv6: 1
     ulimits:
       nofile:
         soft: 65535
@@ -38,20 +30,46 @@ services:
           memory: "16M"
 
   api1:
-    <<: *api
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.0.0
+    platform: linux/amd64
     container_name: rinha-api1
     environment:
-      WARMUP: ${WARMUP:-1}
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
+      KDTREE_EARLY_DIST_MILLI: "140"
+      KDTREE_RELAX_EPSILON: "0.005"
+    volumes:
+      - sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "167M"
 
   api2:
-    <<: *api
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.0.0
+    platform: linux/amd64
     container_name: rinha-api2
     environment:
-      WARMUP: ${WARMUP:-1}
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
+      KDTREE_EARLY_DIST_MILLI: "140"
+      KDTREE_RELAX_EPSILON: "0.005"
+    volumes:
+      - sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "167M"
 
 volumes:
   sockets:
