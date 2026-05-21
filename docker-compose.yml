@@ -1,6 +1,6 @@
 services:
   lapada:
-    image: ghcr.io/gb/lapada:1.0.0
+    image: ghcr.io/gb/lapada:v10
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -23,7 +23,7 @@ services:
           memory: "16M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.0.0
+    image: ghcr.io/gb/jvmoonshot-xxvi:v11
     platform: linux/amd64
     container_name: rinha-api1
     environment:
@@ -44,7 +44,7 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.0.0
+    image: ghcr.io/gb/jvmoonshot-xxvi:v11
     platform: linux/amd64
     container_name: rinha-api2
     environment:
