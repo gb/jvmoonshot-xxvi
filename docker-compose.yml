@@ -20,8 +20,6 @@ services:
     container_name: rinha-lb
     ports:
       - "9999:9999"
-    environment:
-      FD_UPSTREAMS: "/sockets/api1-fd.sock,/sockets/api2-fd.sock"
     volumes:
       - sockets:/sockets
     depends_on:
@@ -42,14 +40,12 @@ services:
     container_name: rinha-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
-      FD_SOCKET: /sockets/api1-fd.sock
 
   api2:
     <<: *api
     container_name: rinha-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
-      FD_SOCKET: /sockets/api2-fd.sock
 
 volumes:
   sockets:
