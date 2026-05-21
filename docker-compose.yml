@@ -41,6 +41,7 @@ services:
     <<: *api
     container_name: rinha-api1
     environment:
+      WARMUP: ${WARMUP:-1}
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
 
@@ -48,6 +49,7 @@ services:
     <<: *api
     container_name: rinha-api2
     environment:
+      WARMUP: ${WARMUP:-1}
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
 
