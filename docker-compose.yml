@@ -1,5 +1,5 @@
 x-api: &api
-  image: ghcr.io/gb/jvmoonshot-xxvi:v26
+  image: ghcr.io/gb/jvmoonshot-xxvi:v1.0.1
   platform: linux/amd64
   environment: &api-env
     KDTREE_EARLY_DIST_MILLI: "161"
