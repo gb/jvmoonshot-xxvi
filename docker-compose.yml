@@ -1,29 +1,6 @@
-x-api: &api
-  image: ghcr.io/gb/jvmoonshot-xxvi:v1.0.1
-  platform: linux/amd64
-  environment: &api-env
-    KDTREE_EARLY_DIST_MILLI: "161"
-    KDTREE_REFINE_BOUNDARY: "1"
-    KDTREE_PRIME_PLUNGE_CAP: "1"
-    KDTREE_PRIME_BBOX: "0"
-    KDTREE_RELAX_SOFT_CAP: "900"
-    KDTREE_RELAX_RANGE: "700"
-    KDTREE_RELAX_EPSILON: "0"
-  volumes:
-    - sockets:/sockets
-  ulimits:
-    nofile:
-      soft: 65535
-      hard: 65535
-  deploy:
-    resources:
-      limits:
-        cpus: "0.45"
-        memory: "167M"
-
 services:
   lb:
-    image: ghcr.io/gb/lapada:v19
+    image: ghcr.io/gb/lapada:1.0-NG
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -33,33 +10,97 @@ services:
     volumes:
       - sockets:/sockets
     depends_on:
-      - api1
-      - api2
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+    mem_limit: "10m"
+    memswap_limit: "10m"
+    pids_limit: 32
     deploy:
       resources:
         limits:
           cpus: "0.10"
-          memory: "16M"
+          memory: "10M"
+          pids: 32
 
   api1:
-    <<: *api
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.0-NG
+    platform: linux/amd64
     container_name: rinha-api1
     environment:
-      <<: *api-env
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
+      READY_FILE: /sockets/api1.ready
+      KDTREE_EARLY_DIST_MILLI: "161"
+      KDTREE_REFINE_BOUNDARY: "1"
+      KDTREE_PRIME_PLUNGE_CAP: "1"
+      KDTREE_RELAX_SOFT_CAP: "900"
+      KDTREE_RELAX_RANGE: "700"
+      KDTREE_RELAX_EPSILON: "0.025"
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /sockets/api1.ready && test -S /sockets/api1-fd.sock"]
+      interval: 60s
+      timeout: 1s
+      retries: 30
+      start_period: 60s
+      start_interval: 1s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    mem_limit: "167m"
+    memswap_limit: "167m"
+    pids_limit: 64
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "167M"
+          pids: 64
 
   api2:
-    <<: *api
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.0-NG
+    platform: linux/amd64
     container_name: rinha-api2
     environment:
-      <<: *api-env
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
+      READY_FILE: /sockets/api2.ready
+      KDTREE_EARLY_DIST_MILLI: "161"
+      KDTREE_REFINE_BOUNDARY: "1"
+      KDTREE_PRIME_PLUNGE_CAP: "1"
+      KDTREE_RELAX_SOFT_CAP: "900"
+      KDTREE_RELAX_RANGE: "700"
+      KDTREE_RELAX_EPSILON: "0.025"
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /sockets/api2.ready && test -S /sockets/api2-fd.sock"]
+      interval: 60s
+      timeout: 1s
+      retries: 30
+      start_period: 60s
+      start_interval: 1s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    mem_limit: "167m"
+    memswap_limit: "167m"
+    pids_limit: 64
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "167M"
+          pids: 64
 
 volumes:
   sockets:
