@@ -20,13 +20,11 @@ services:
         hard: 65535
     mem_limit: "10m"
     memswap_limit: "10m"
-    pids_limit: 32
     deploy:
       resources:
         limits:
           cpus: "0.10"
           memory: "10M"
-          pids: 32
 
   api1:
     image: ghcr.io/gb/jvmoonshot-xxvi:1.0-NG
@@ -57,13 +55,11 @@ services:
         hard: 65535
     mem_limit: "167m"
     memswap_limit: "167m"
-    pids_limit: 64
     deploy:
       resources:
         limits:
           cpus: "0.45"
           memory: "167M"
-          pids: 64
 
   api2:
     image: ghcr.io/gb/jvmoonshot-xxvi:1.0-NG
@@ -94,13 +90,11 @@ services:
         hard: 65535
     mem_limit: "167m"
     memswap_limit: "167m"
-    pids_limit: 64
     deploy:
       resources:
         limits:
           cpus: "0.45"
           memory: "167M"
-          pids: 64
 
 volumes:
   sockets:
