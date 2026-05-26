@@ -41,6 +41,10 @@ public final class KdTreeProbes {
         return KdTreeScratch.scratchTL.get().bboxPrunes;
     }
 
+    public static int lastBboxPrunesLo() {
+        return KdTreeScratch.scratchTL.get().bboxPrunesLo;
+    }
+
     public static int lastTopKFilledAt() {
         return KdTreeScratch.scratchTL.get().topKFilledAt;
     }

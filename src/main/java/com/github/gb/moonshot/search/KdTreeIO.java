@@ -15,14 +15,14 @@ import static com.github.gb.moonshot.search.KdTree.*;
  * Layout: short[] pts (n*STRIDE), int[] origId (n), byte[] fraud (n),
  * int topNodeCount, short[] topBbox (topNodeCount*STRIDE_BBOX), int[] topSlot (n).
  * All multi-byte values little-endian.
- * Note: right child index is packed into pts[LANE_RIGHT..LANE_RIGHT+1] (STRIDE=20 layout);
- * there is no separate right[] section in the file.
+ * Note: right child, split dim, left-present flag, and fraud flag are packed into
+ * pts[LANE_NAV..LANE_NAV+1]; there is no separate right[] section in the file.
  */
 public final class KdTreeIO {
 
-    static final String MAGIC = "RKDTS022"; // RKDT + S(short) + 022: DIM_PERMUTATION changed
+    static final String MAGIC = "RKDTS025"; // RKDT + S(short) + 025: nav adds hasBbox + childrenHaveBbox bits
 
-    private static final int HEADER_BYTES = 8 + 4 * 4; // magic + n, dims, stride, root
+    private static final int HEADER_BYTES = 64;
     private static final int IO_CHUNK = 8 * 1024 * 1024;
 
     private KdTreeIO() {
@@ -39,6 +39,7 @@ public final class KdTreeIO {
             hdr.putInt(DIMS);
             hdr.putInt(STRIDE);
             hdr.putInt(0); // root always 0
+            hdr.position(HEADER_BYTES);
             hdr.flip();
             writeFully(ch, hdr);
 
@@ -83,9 +84,9 @@ public final class KdTreeIO {
 
     /**
      * Production loader: mmap pts (n*STRIDE*2 bytes) off the JVM heap to stay within -Xmx65m.
-     * origId and fraud are skipped — fraud flag lives in pts lane {@link KdTree#LANE_FRAUD} (18),
+     * origId and fraud are skipped — fraud flag lives in the packed nav word,
      * read directly from the mmap in {@link TopKSortedArray#countFraudsFromMmap}.
-     * Heap: topSlot+topBbox ≈ 28 MB for n=3M — 37 MB headroom at -Xmx65m (3 MB freed vs v020).
+     * Heap: topSlot+topBbox ≈ 28 MB for n=3M; pts is off-heap via mmap.
      */
     public static KdTree loadMmap(Path file) throws IOException {
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
@@ -99,7 +100,7 @@ public final class KdTreeIO {
 
             // Skip origId (not on hot path).
             ch.position(ch.position() + (long) n * 4L);
-            // Skip separate fraud section — fraud is now in pts lane LANE_FRAUD (18).
+            // Skip separate fraud section — fraud is now in the packed nav word.
             ch.position(ch.position() + (long) n);
 
             ByteBuffer meta = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);

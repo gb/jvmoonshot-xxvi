@@ -1,13 +1,13 @@
 package com.github.gb.moonshot.search;
 
-import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.IntVector;
-import jdk.incubator.vector.VectorMask;
-import jdk.incubator.vector.VectorSpecies;
-
 /**
- * Data-geometry constants, SIMD species/masks, and packed-nav encode/decode for the KD-tree.
- * No mutable state, no env reads. All fields are compile-time constants or final at class load.
+ * Data-geometry constants, packed-nav encode/decode for the KD-tree. No mutable state, no env
+ * reads. All fields are compile-time constants or final at class load.
+ *
+ * <p>An earlier Vector API SIMD path (SPECIES_256, TAIL_MASK, LANES_0_5_KEEP_INTS, ZERO) lived
+ * here but was removed once {@code DistKernelBench} confirmed that on JDK 25 the auto-vectorized
+ * scalar form in {@code KdTree.distSumI16AtBase} is 20 % faster than the explicit Vector API
+ * (which still allocates ~34 B/op through {@code ShortVector.convertShape}).
  */
 public final class KdTreeLayout {
 
@@ -16,66 +16,74 @@ public final class KdTreeLayout {
      */
     public static final int DIMS = 14;
     /**
-     * Float array stride per node (DIMS + 2 nav lanes).
+     * Short array stride per KD-tree node: 14 feature lanes plus one packed i32 nav word.
      */
     public static final int STRIDE = 16;
 
     /**
-     * Variance-descending lane order. Drives split-dim tie-breaking toward the highest-variance
-     * dimension, yielding a more balanced tree and fewer visits per query. Tuned offline via
-     * {@code DimPermTuner} against vectorized transaction payload banks.
+     * Legacy non-PCA lane order. Drives split-dim tie-breaking toward dimensions that reduce
+     * visit p99 for the current query distribution. Re-tune with {@code DimPermTuner} whenever
+     * fixture generation changes materially, because randomized dates / last-transaction ranges
+     * can shift which dimensions dominate tail search work.
+     *
+     * <p>Production PCA builds bypass this permutation (PCA emits its own axis order). Treat this
+     * constant as relevant only for {@link KdTreeBuilder#build(com.github.gb.moonshot.Dataset)}
+     * and non-PCA comparison tools; PCA-specific changes need their own validation.
      */
-    public static final int[] DIM_PERMUTATION = {6, 10, 9, 5, 11, 2, 4, 7, 0, 1, 3, 8, 12, 13};
+    public static final int[] DIM_PERMUTATION = {6, 1, 9, 5, 11, 13, 2, 7, 0, 10, 3, 8, 12, 4};
 
-    /**
-     * Lane within a stride-16 node that carries the packed {@code (leftIdx | splitDim)} nav int.
-     */
-    static final int LANE_LEFT_DIM = 14;
-    /**
-     * Lane within a stride-16 node that carries the right child index.
-     */
-    static final int LANE_RIGHT = 15;
+    /** Low short lane of the packed nav int. High short lane is {@code LANE_NAV + 1}. */
+    static final int LANE_NAV = 14;
 
-    static final VectorSpecies<Float> SPECIES = FloatVector.SPECIES_256;
-
+    private static final int RIGHT_BITS = 23;
+    private static final int RIGHT_MASK = (1 << RIGHT_BITS) - 1;
+    private static final int DIM_SHIFT = RIGHT_BITS;
+    private static final int FRAUD_SHIFT = DIM_SHIFT + 4;
+    private static final int HAS_LEFT_SHIFT = FRAUD_SHIFT + 1;
     /**
-     * Masks lanes 6–7 of the second 8-float chunk at load time — used only in bboxDistSquared
-     * where the last topBbox slot may be OOB and the mask prevents the unsafe read.
-     * <p>For distSquared we use {@link #LANES_0_5_KEEP_INTS} instead: an unmasked load + integer
-     * AND avoids the per-call broadcast through AbstractMask.checkIndexByLane (was ~20% CPU).
+     * Set iff this node's depth ≤ {@link com.github.gb.moonshot.search.KdTree#TOP_BBOX_DEPTH},
+     * i.e. {@code topSlot[treeIdx] >= 0}. Lets the bbox-prune site short-circuit the 12 MB
+     * {@code topSlot[]} random probe for deep nodes.
      */
-    static final VectorMask<Float> TAIL_MASK = VectorMask.fromLong(SPECIES, 0b00111111L);
-
+    private static final int HAS_BBOX_SHIFT = HAS_LEFT_SHIFT + 1;
     /**
-     * Integer bit-mask for {@code distSquared}'s second SIMD chunk: keeps lanes 0–5 (real dims
-     * 8–13) and zeros lanes 6–7 (packed nav int-bits). Unmasked float or int load + AND bypasses
-     * AbstractMask.checkIndexByLane's per-call broadcast that dominated profiles at peak load.
-     * OOB-safe: the pts segment is sized n*STRIDE*4 bytes; every node has all 16 lanes written.
+     * Set iff this node's depth &lt; {@link com.github.gb.moonshot.search.KdTree#TOP_BBOX_DEPTH},
+     * i.e. {@code topSlot[child] >= 0} for both children. Lets the BBF-push site replace the
+     * {@code topSlot[far]} random probe with a single bit test on the already-loaded parent nav.
      */
-    static final IntVector LANES_0_5_KEEP_INTS =
-            IntVector.fromArray(IntVector.SPECIES_256, new int[]{-1, -1, -1, -1, -1, -1, 0, 0}, 0);
+    private static final int CHILDREN_HAVE_BBOX_SHIFT = HAS_BBOX_SHIFT + 1;
+    public static final int HAS_BBOX_MASK = 1 << HAS_BBOX_SHIFT;
+    public static final int CHILDREN_HAVE_BBOX_MASK = 1 << CHILDREN_HAVE_BBOX_SHIFT;
 
-    /**
-     * Pre-materialised zero vector; {@code .max(ZERO)} folds to a register-resident vxorps.
-     */
-    static final FloatVector ZERO = FloatVector.zero(SPECIES);
-
-    /**
-     * Packs a left-child index (28 bits, signed) and split dimension (4 bits) into one int.
-     */
-    static int packLeftAndDim(int left, int dim) {
-        return (left & 0x0FFFFFFF) | ((dim & 0xF) << 28);
+    static int packNav(int right, int dim, boolean fraud, boolean hasLeft,
+                       boolean hasBbox, boolean childrenHaveBbox) {
+        int rightPlusOne = right + 1;
+        if ((rightPlusOne & ~RIGHT_MASK) != 0) {
+            throw new IllegalArgumentException("right child out of packed-nav range: " + right);
+        }
+        return rightPlusOne
+                | ((dim & 0xF) << DIM_SHIFT)
+                | (fraud ? (1 << FRAUD_SHIFT) : 0)
+                | (hasLeft ? (1 << HAS_LEFT_SHIFT) : 0)
+                | (hasBbox ? HAS_BBOX_MASK : 0)
+                | (childrenHaveBbox ? CHILDREN_HAVE_BBOX_MASK : 0);
     }
 
-    /**
-     * Sign-extends the 28-bit signed left index, preserving the {@code -1} absent-child sentinel.
-     */
-    static int unpackLeft(int leftAndDim) {
-        return (leftAndDim << 4) >> 4;
+    static int unpackLeft(int treeIdx, int nav) {
+        return ((nav >>> HAS_LEFT_SHIFT) & 1) != 0 ? treeIdx + 1 : -1;
     }
 
-    static int unpackDim(int leftAndDim) {
-        return (leftAndDim >>> 28) & 0xF;
+    static int unpackRight(int nav) {
+        int rightPlusOne = nav & RIGHT_MASK;
+        return rightPlusOne == 0 ? -1 : rightPlusOne - 1;
+    }
+
+    static int unpackDim(int nav) {
+        return (nav >>> DIM_SHIFT) & 0xF;
+    }
+
+    static int unpackFraud(int nav) {
+        return (nav >>> FRAUD_SHIFT) & 1;
     }
 
     private KdTreeLayout() {

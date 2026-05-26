@@ -28,6 +28,28 @@ final class KdTreeTuning {
         MAX_VISITS_ENABLED = MAX_VISITS_BUDGET != Integer.MAX_VALUE;
     }
 
+    // ── EARLY_DONE ───────────────────────────────────────────────────────────────────────────────
+    // Confidence shortcut after the prime/plunge seed: if the current kth candidate is already
+    // within this L2 distance, skip the remaining BBF search. Default disabled.
+
+    static final boolean EARLY_DONE_ENABLED;
+    static final int EARLY_DONE_SUM;
+
+    static {
+        String v = System.getenv("KDTREE_EARLY_DIST_MILLI");
+        int parsedMilli = 0;
+        if (v != null && !v.isEmpty()) {
+            try {
+                parsedMilli = Integer.parseInt(v);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        EARLY_DONE_ENABLED = parsedMilli > 0;
+        int scaled = Math.max(0, parsedMilli) * (KdTree.SCALE / 1000);
+        long sum = (long) scaled * scaled;
+        EARLY_DONE_SUM = sum > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) sum;
+    }
+
     // ── RELAX ─────────────────────────────────────────────────────────────────────────────────────
     // Epsilon-relaxed pruning: once visits > RELAX_SOFT_CAP, prune thresholds shrink linearly from
     // 1.0 to (1 − epsilon) over RELAX_RANGE additional visits. A subtree pruned under relaxation
@@ -40,13 +62,13 @@ final class KdTreeTuning {
 
     /**
      * Captured once at class load. Being {@code static final}, C2 constant-folds
-     * {@link #relaxScale}: when false (epsilon=0 at startup) the entire body collapses to
-     * {@code return 1.0f}. When true, only the relaxation arithmetic remains.
+     * {@link #relaxScaleQ16}: when false (epsilon=0 at startup) the entire body collapses to
+     * {@code return 65536}. When true, only the relaxation arithmetic remains.
      */
     static final boolean RELAX_INITIALLY_ENABLED;
     /**
      * Mirrors {@link #RELAX_SOFT_CAP} at class load as a {@code static final} so C2 inlines the
-     * literal 1500 into {@link #relaxScale}'s fast exit, eliminating the per-call field read.
+     * literal 1500 into {@link #relaxScaleQ16}'s fast exit, eliminating the per-call field read.
      */
     static final int RELAX_SOFT_CAP_INIT;
 
@@ -79,7 +101,7 @@ final class KdTreeTuning {
     // ── PRIME ─────────────────────────────────────────────────────────────────────────────────────
     // Fan-out + greedy-plunge seed strategy at query start (see KdTree.prime).
 
-    static int PRIME_PLUNGE_CAP = 4;
+    static int PRIME_PLUNGE_CAP = 1;
 
     static {
         String v = System.getenv("KDTREE_PRIME_PLUNGE_CAP");
@@ -113,19 +135,83 @@ final class KdTreeTuning {
         REFINE_BOUNDARY = "1".equals(v) || "true".equalsIgnoreCase(v);
     }
 
+    // ── Bucket-leaf prototype ───────────────────────────────────────────────────────────────────
+    // Exact experiment: once traversal reaches this depth, linearly scan the contiguous preorder
+    // subtree range instead of continuing recursive/BBF descent. Disabled by default.
+
+    static final int BUCKET_LEAF_DEPTH;
+    static final int BUCKET_LEAF_MAX_NODES;
+
+    static {
+        String depth = System.getenv("KDTREE_BUCKET_LEAF_DEPTH");
+        int parsed = Integer.MAX_VALUE;
+        if (depth != null && !depth.isEmpty()) {
+            try {
+                parsed = Integer.parseInt(depth);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        BUCKET_LEAF_DEPTH = parsed <= 0 ? Integer.MAX_VALUE : parsed;
+
+        String maxNodes = System.getenv("KDTREE_BUCKET_LEAF_MAX_NODES");
+        parsed = Integer.MAX_VALUE;
+        if (maxNodes != null && !maxNodes.isEmpty()) {
+            try {
+                parsed = Integer.parseInt(maxNodes);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        BUCKET_LEAF_MAX_NODES = parsed <= 0 ? Integer.MAX_VALUE : parsed;
+    }
+
     // ── Derived ───────────────────────────────────────────────────────────────────────────────────
 
     /**
-     * Multiplicative scale applied to prune thresholds at {@code visits} visited nodes.
-     * Returns 1.0 (exact) when disabled or visits ≤ soft cap; < 1.0 during relaxation.
-     * {@link #RELAX_INITIALLY_ENABLED} is {@code static final}: C2 folds the fast-path to a
-     * single {@code return 1.0f} with no field reads when epsilon was 0 at class load.
+     * Integer Q16 relax scale: returns {@code round(scale * 65536)}. Hot path uses this to
+     * avoid the int→float→int round-trip and a float divide. Production tuning (epsilon,
+     * soft-cap, range) is fixed at class load so the per-visit slope folds into a single
+     * 64-bit integer multiply.
+     *
+     * <p>Slope is stored at Q32 precision (not Q16) so that {@code delta * slope} produces a
+     * subtractor accurate to ~10⁻⁹ relative to a float-domain scale — recall byte-identical
+     * to the float form (which lived here before commit 16afab3) on the contest fixture.
      */
-    static float relaxScale(int visits) {
-        if (!RELAX_INITIALLY_ENABLED || visits <= RELAX_SOFT_CAP_INIT) return 1.0f;
-        if (RELAX_MAX_EPSILON == 0f) return 1.0f;
-        float t = Math.min(1.0f, (float) (visits - RELAX_SOFT_CAP) / RELAX_RANGE);
-        return 1.0f - RELAX_MAX_EPSILON * t;
+    static final long RELAX_EPSILON_Q32_PER_VISIT;
+    static final int  RELAX_MAX_SUB_Q16;
+    static final int  RELAX_RANGE_INIT;
+    /**
+     * Precomputed Q16 scale per (visits − softCap − 1), capped at RELAX_RANGE_INIT − 1.
+     * Replaces a 64-bit multiply + shift on the hot path with a single int[] load.
+     * Size: range_init × 4 bytes (~2.8 KB for default 700) — fits comfortably in L1d.
+     */
+    static final int[] RELAX_SCALE_Q16_TABLE;
+
+    static {
+        RELAX_RANGE_INIT = Math.max(1, RELAX_RANGE);
+        if (RELAX_INITIALLY_ENABLED) {
+            // Slope at Q32 (8 fractional digits of decimal precision).
+            RELAX_EPSILON_Q32_PER_VISIT = Math.round(
+                    (double) RELAX_MAX_EPSILON * 4294967296.0 / RELAX_RANGE_INIT);
+            RELAX_MAX_SUB_Q16 = Math.round(RELAX_MAX_EPSILON * 65536f);
+            int[] tbl = new int[RELAX_RANGE_INIT];
+            for (int d = 0; d < RELAX_RANGE_INIT; d++) {
+                long subQ32 = (long)(d + 1) * RELAX_EPSILON_Q32_PER_VISIT;
+                tbl[d] = 65536 - (int) (subQ32 >>> 16);
+            }
+            RELAX_SCALE_Q16_TABLE = tbl;
+        } else {
+            RELAX_EPSILON_Q32_PER_VISIT = 0L;
+            RELAX_MAX_SUB_Q16 = 0;
+            RELAX_SCALE_Q16_TABLE = new int[0];
+        }
+    }
+
+    static int relaxScaleQ16(int visits) {
+        if (!RELAX_INITIALLY_ENABLED) return 65536;
+        int delta = visits - RELAX_SOFT_CAP_INIT;
+        if (delta <= 0) return 65536;
+        if (delta >= RELAX_RANGE_INIT) return 65536 - RELAX_MAX_SUB_Q16;
+        return RELAX_SCALE_Q16_TABLE[delta - 1];
     }
 
     // ── PROFILING ─────────────────────────────────────────────────────────────────────────────────

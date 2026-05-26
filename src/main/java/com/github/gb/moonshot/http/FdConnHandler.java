@@ -102,7 +102,7 @@ public final class FdConnHandler {
                     // bodyStart is -1 so enterDrainMode() would set bytesToDrain to a large
                     // negative value and the drain loop would not execute, leaving unread
                     // data in the TCP stream that would corrupt the next request.
-                    writeResponse(channel, state, ResponseEncoder.badRequestClose());
+                    writeResponse(channel, ResponseEncoder.RESP_BAD_REQUEST_CLOSE);
                     return;
                 }
                 int n = channel.read(state.readBuf);
@@ -112,11 +112,11 @@ public final class FdConnHandler {
                 int result = state.tryParse();
                 if (result == HttpConnection.READY) break;
                 if (result == HttpConnection.MALFORMED) {
-                    writeResponse(channel, state, ResponseEncoder.badRequestClose());
+                    writeResponse(channel, ResponseEncoder.RESP_BAD_REQUEST_CLOSE);
                     return; // close
                 }
                 if (result == HttpConnection.TOO_LARGE) {
-                    writeResponse(channel, state, ResponseEncoder.payloadTooLargeKeepAlive());
+                    writeResponse(channel, ResponseEncoder.RESP_PAYLOAD_TOO_LARGE);
                     state.enterDrainMode();
                     while (state.isDraining()) {
                         state.readBuf.limit(Math.min(cap, state.bytesToDrain));
@@ -134,22 +134,17 @@ public final class FdConnHandler {
 
             if (state.bodyStart < 0) continue; // came from drain-reset, no request to route
 
-            byte[] response = router.route(state.routeId, raw, state.bodyStart, state.bodyLen);
-            writeResponse(channel, state, response);
+            int respIdx = router.routeResponseIndex(state.routeId, raw, state.bodyStart, state.bodyLen);
+            writeResponse(channel, respIdx);
             state.advanceAfterRequest();
         }
     }
 
-    private static void writeResponse(SocketChannel channel, HttpConnection state, byte[] response)
-            throws IOException {
-        ByteBuffer out = state.writeBuf;
-        out.clear();
-        out.put(response);
-        out.flip();
+    private static void writeResponse(SocketChannel channel, int respIdx) throws IOException {
+        ByteBuffer out = ResponseEncoder.duplicateFor(respIdx);
         while (out.hasRemaining()) {
             channel.write(out);
         }
-        out.clear();
     }
 
     private FdConnHandler() {

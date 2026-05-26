@@ -14,7 +14,7 @@ import java.nio.file.Path;
  *
  *   java -cp target/jvmoonshot-xxvi.jar com.github.gb.moonshot.bench.BuildKdTree \
  *        [--in  path/to/references.json.gz] \
- *        [--out path/to/kdtree-i16.bin]
+ *        [--out path/to/kdtree.bin]
  */
 public final class BuildKdTree {
 
@@ -24,7 +24,7 @@ public final class BuildKdTree {
         String referencesPath = CliArgs.string(args, "--in", System.getenv().getOrDefault(
             "REFERENCES_PATH",
             "../rinha-de-backend-2026/resources/references.json.gz"));
-        String outPathArg = CliArgs.string(args, "--out", "data/kdtree-i16.bin");
+        String outPathArg = CliArgs.string(args, "--out", "data/kdtree.bin");
         int n = CliArgs.intVal(args, "--n", 0);
 
         log("loading dataset from " + referencesPath + (n > 0 ? " (first " + n + ")" : ""));

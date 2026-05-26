@@ -8,6 +8,7 @@ import java.net.SocketAddress;
 import java.net.StandardProtocolFamily;
 import java.net.StandardSocketOptions;
 import java.net.UnixDomainSocketAddress;
+import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
@@ -21,21 +22,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
- * Single-thread NIO event loop. Zero-alloc steady-state: each connection owns its read/write buffers and reuses them
- * across pipelined keep-alive requests.
+ * Single-thread NIO event loop. Zero-alloc-per-request steady-state: each connection owns its read buffer and
+ * gathering-write pipeline, and pre-baked shared direct response buffers are duplicated (~40 B young-gen) per
+ * response.
  * <p>
  * Contest workload: only {@code POST /fraud-score} (and {@code GET /ready} once at boot). Everything else is treated
  * as a malformed peer.
  */
 public final class NioHttpServer {
 
-    private static final byte[] HTTP_400_CLOSE = ResponseEncoder.badRequestClose();
-    private static final byte[] HTTP_413_KEEPALIVE = ResponseEncoder.payloadTooLargeKeepAlive();
-
     private static final int LISTEN_BACKLOG = 1024;
-    // Largest real response frame is ~110 B; 256 is the headroom guard so drainRequests bails before a pipelined
-    // burst overflows writeBuf.
-    private static final int MAX_RESPONSE_BYTES = 256;
 
     /** Error logging is off by default: synchronized stderr writes are catastrophic during short p99 runs. */
     private static final boolean LOG_IO_ERRORS = "1".equals(System.getenv("LOG_IO_ERRORS"));
@@ -184,7 +180,7 @@ public final class NioHttpServer {
         if (bytesRead == 0) return;
 
         if (drainRequests(state, router)) {
-            flushWriteBuf(key, channel, state);
+            flushPipeline(key, channel, state);
         }
     }
 
@@ -203,40 +199,44 @@ public final class NioHttpServer {
 
     private static boolean drainRequests(HttpConnection state, Router router) {
         boolean queued = false;
+        final boolean timed = StageTimer.ENABLED;
         while (true) {
-            // tryParse is idempotent once bodyStart >= 0, so bailing here and resuming on the next OP_READ event
-            // re-enters the same request.
-            if (state.writeBuf.remaining() < MAX_RESPONSE_BYTES) {
+            // Force a flush before queueing if the per-conn pipeline is full. The cap bounds
+            // per-conn ByteBuffer[] memory and ensures gathering write fits in one syscall under
+            // realistic SNDBUF sizes.
+            if (state.pipelineCount >= HttpConnection.MAX_PIPELINE_SLOTS) {
                 return true;
             }
+            // tryParse is idempotent once bodyStart >= 0, so bailing here and resuming on the next OP_READ event
+            // re-enters the same request.
             int parseResult = state.tryParse();
             if (parseResult == HttpConnection.NEED_MORE) {
                 // Wedged headers (no \r\n\r\n in 4 KB): force-close, else the level-triggered selector spins
                 // forever on OP_READ.
                 if (state.bodyStart < 0 && !state.readBuf.hasRemaining()) {
-                    state.writeBuf.put(HTTP_400_CLOSE);
+                    queueResponse(state, ResponseEncoder.RESP_BAD_REQUEST_CLOSE);
                     state.closeAfterWrite = true;
                     return true;
                 }
                 return queued;
             }
             if (parseResult == HttpConnection.MALFORMED) {
-                state.writeBuf.put(HTTP_400_CLOSE);
+                queueResponse(state, ResponseEncoder.RESP_BAD_REQUEST_CLOSE);
                 state.closeAfterWrite = true;
                 return true;
             }
             if (parseResult == HttpConnection.TOO_LARGE) {
-                state.writeBuf.put(HTTP_413_KEEPALIVE);
+                queueResponse(state, ResponseEncoder.RESP_PAYLOAD_TOO_LARGE);
                 state.enterDrainMode();
                 return true;
             }
-            if (StageTimer.ENABLED) StageTimer.t0 = System.nanoTime();
-            byte[] response = state.routeId == Router.ROUTE_FRAUD_SCORE
-                    ? router.fraudScoreResponse(state.readBuf.array(), state.bodyStart, state.bodyLen)
-                    : router.route(state.routeId, state.readBuf.array(), state.bodyStart, state.bodyLen);
-            if (StageTimer.ENABLED) StageTimer.mark(3, System.nanoTime());
-            state.writeBuf.put(response);
-            if (StageTimer.ENABLED) {
+            if (timed) StageTimer.t0 = System.nanoTime();
+            int respIdx = state.routeId == Router.ROUTE_FRAUD_SCORE
+                    ? router.fraudScoreResponseIndex(state.readBuf.array(), state.bodyStart, state.bodyLen)
+                    : router.routeResponseIndex(state.routeId, state.readBuf.array(), state.bodyStart, state.bodyLen);
+            if (timed) StageTimer.mark(3, System.nanoTime());
+            queueResponse(state, respIdx);
+            if (timed) {
                 StageTimer.mark(4, System.nanoTime());
                 StageTimer.complete();
             }
@@ -245,14 +245,21 @@ public final class NioHttpServer {
         }
     }
 
-    private static void flushWriteBuf(SelectionKey key, SocketChannel channel, HttpConnection state) throws IOException {
-        state.writeBuf.flip();
-        // Try one immediate write saves a select() round-trip when the kernel send buffer has space.
-        channel.write(state.writeBuf);
-        if (state.writeBuf.hasRemaining()) {
+    private static void queueResponse(HttpConnection state, int respIdx) {
+        // Per-write duplicate aliases shared direct memory but owns its own position/limit so the
+        // gathering write can advance it independently. ~40 B young-gen alloc per response.
+        state.pipeline[state.pipelineCount++] = ResponseEncoder.duplicateFor(respIdx);
+    }
+
+    private static void flushPipeline(SelectionKey key, SocketChannel channel, HttpConnection state) throws IOException {
+        // Single writev for all queued responses. Each ByteBuffer's position is advanced by the
+        // bytes consumed from it; fully-drained buffers reach position==limit and contribute nothing
+        // on a subsequent call, partially-drained buffers resume from where they left off.
+        channel.write(state.pipeline, 0, state.pipelineCount);
+        if (pipelineHasRemaining(state)) {
             key.interestOps(SelectionKey.OP_WRITE);
         } else {
-            state.writeBuf.clear();
+            resetPipeline(state);
             if (state.closeAfterWrite) {
                 close(key);
             }
@@ -263,15 +270,32 @@ public final class NioHttpServer {
         SocketChannel channel = (SocketChannel) key.channel();
         HttpConnection state = (HttpConnection) key.attachment();
 
-        channel.write(state.writeBuf);
-        if (state.writeBuf.hasRemaining()) return;
+        channel.write(state.pipeline, 0, state.pipelineCount);
+        if (pipelineHasRemaining(state)) return;
 
-        state.writeBuf.clear();
+        resetPipeline(state);
         if (state.closeAfterWrite) {
             close(key);
             return;
         }
         key.interestOps(SelectionKey.OP_READ);
+    }
+
+    private static boolean pipelineHasRemaining(HttpConnection state) {
+        for (int i = 0; i < state.pipelineCount; i++) {
+            if (state.pipeline[i].hasRemaining()) return true;
+        }
+        return false;
+    }
+
+    private static void resetPipeline(HttpConnection state) {
+        // Null out slot references so the per-write duplicates become unreachable and get
+        // collected on the next young-gen pass. Avoids retaining ByteBuffer wrappers across
+        // long-lived keep-alive connections.
+        ByteBuffer[] arr = state.pipeline;
+        int n = state.pipelineCount;
+        for (int i = 0; i < n; i++) arr[i] = null;
+        state.pipelineCount = 0;
     }
 
     private static void logIoError(Throwable t) {

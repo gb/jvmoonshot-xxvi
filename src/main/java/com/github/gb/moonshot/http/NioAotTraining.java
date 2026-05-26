@@ -198,8 +198,8 @@ public final class NioAotTraining {
     }
 
     /**
-     * Exercises the tryParse → route → writeBuf cycle so the JIT-compiled forms land in the AOT cache instead of
-     * compiling under live k6 traffic. Returns a DCE-defeat sink.
+     * Exercises the tryParse → route → duplicate-for-write cycle so the JIT-compiled forms land in the AOT cache
+     * instead of compiling under live k6 traffic. Returns a DCE-defeat sink.
      */
     public static long trainAotHotPath(Router router, byte[][] requestFrames, int iters) {
         HttpConnection conn = new HttpConnection();
@@ -213,16 +213,12 @@ public final class NioAotTraining {
             if (result != HttpConnection.READY) continue;
 
             byte[] body = conn.readBuf.array();
-            byte[] response = conn.routeId == Router.ROUTE_FRAUD_SCORE
-                    ? router.fraudScoreResponse(body, conn.bodyStart, conn.bodyLen)
-                    : router.route(conn.routeId, body, conn.bodyStart, conn.bodyLen);
-            sink ^= response[0];
-
-            conn.writeBuf.clear();
-            conn.writeBuf.put(response);
-            conn.writeBuf.flip();
-            while (conn.writeBuf.hasRemaining()) sink ^= conn.writeBuf.get();
-            conn.writeBuf.clear();
+            int respIdx = conn.routeId == Router.ROUTE_FRAUD_SCORE
+                    ? router.fraudScoreResponseIndex(body, conn.bodyStart, conn.bodyLen)
+                    : router.routeResponseIndex(conn.routeId, body, conn.bodyStart, conn.bodyLen);
+            ByteBuffer out = com.github.gb.moonshot.codec.ResponseEncoder.duplicateFor(respIdx);
+            sink ^= out.get(0);
+            while (out.hasRemaining()) sink ^= out.get();
             conn.advanceAfterRequest();
         }
         return sink;

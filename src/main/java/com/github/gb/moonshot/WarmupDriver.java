@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -47,7 +48,7 @@ public final class WarmupDriver {
      * code path (active above RELAX_SOFT_CAP visits) sees realistic high-visit queries during JIT
      * warm-up. Period=16 → 6.25% far queries (up from 1.56% at period=64); far queries reach
      * visit counts well above SOFT_CAP=1500 while near queries stay below it, so both branches
-     * of relaxScale get meaningful profile coverage before production traffic starts.
+     * of relaxScaleQ16 get meaningful profile coverage before production traffic starts.
      */
     private static final int FAR_QUERY_PERIOD = 16;
 
@@ -200,8 +201,8 @@ public final class WarmupDriver {
         int iter = 0;
         while (iter < ROUTE_ITERS && System.nanoTime() < deadlineNanos) {
             byte[] body = bodies[iter % bodies.length];
-            byte[] response = router.fraudScoreResponse(body, 0, body.length);
-            sink ^= response[0];
+            int respIdx = router.fraudScoreResponseIndex(body, 0, body.length);
+            sink ^= respIdx;
             iter++;
         }
         return iter;
@@ -231,53 +232,112 @@ public final class WarmupDriver {
     }
 
     public static byte[][] buildTemplateBodies() {
-        String[] mccs = { "5912", "5411", "5732", "4111", "7011" };
-        int[] installments = { 1, 3, 12, 6 };
-        int[] knownMerchantsCounts = { 0, 1, 3, 5 };
-        boolean[] flags = { false, true };
+        String[] requestedAt = {
+            "2026-03-01T09:23:35Z", "2026-07-18T16:12:04Z", "2027-02-09T11:44:19Z", "2027-10-27T19:51:02Z",
+            "2028-01-14T02:08:43Z", "2028-06-03T05:37:10Z", "2028-12-22T00:19:58Z", "2029-04-11T06:45:31Z",
+            "2029-09-28T03:02:17Z", "2030-01-06T14:26:50Z", "2030-05-19T20:05:13Z", "2030-12-28T18:39:44Z",
+            "2026-11-07T10:17:25Z", "2027-05-16T22:48:07Z", "2029-02-24T13:59:36Z", "2030-08-12T04:31:21Z"
+        };
+        String[] lastAt = {
+            null, "2023-04-21T08:11:02Z", "2026-12-29T15:39:44Z", "2022-10-05T13:27:19Z",
+            "2019-03-08T01:41:03Z", null, "2020-12-17T20:22:50Z", "2024-06-03T05:18:12Z",
+            "2016-08-30T23:59:58Z", "2028-11-19T11:02:45Z", null, "2026-01-14T17:09:32Z",
+            "2021-07-01T07:26:54Z", "2025-05-16T21:48:07Z", "2028-02-22T13:59:36Z", "2027-09-12T04:31:21Z"
+        };
+        double[] amount = {
+            41.12, 288.45, 476.90, 123.34,
+            7340.10, 9505.97, 2218.55, 6682.32,
+            4890.71, 510.40, 1840.25, 2990.99,
+            395.00, 430.50, 2760.80, 2450.65
+        };
+        int[] installments = { 1, 2, 3, 1, 8, 10, 6, 12, 7, 3, 5, 7, 3, 4, 6, 5 };
+        double[] customerAvg = {
+            82.24, 410.12, 953.80, 232.10,
+            123.55, 88.91, 245.40, 174.20,
+            298.73, 340.00, 208.65, 455.35,
+            700.20, 112.00, 280.50, 430.15
+        };
+        int[] tx24h = { 1, 3, 5, 2, 8, 19, 12, 15, 10, 4, 9, 11, 5, 6, 18, 7 };
+        int[] knownStart = { 1, 4, 7, 10, 2, 5, 8, 11, 14, 3, 6, 9, 12, 15, 17, 1 };
+        int[] knownCount = { 2, 4, 5, 3, 2, 5, 4, 3, 5, 2, 4, 5, 3, 4, 2, 5 };
+        String[] merchantId = {
+            "MERC-001", "MERC-006", "MERC-011", "MERC-012",
+            "MERC-050", "MERC-088", "MERC-063", "MERC-097",
+            "MERC-074", "MERC-031", "MERC-047", "MERC-059",
+            "MERC-014", "MERC-038", "MERC-091", "MERC-055"
+        };
+        String[] mccs = {
+            "5411", "5812", "5912", "5311",
+            "7995", "7801", "7802", "7995",
+            "7801", "5944", "4511", "5999",
+            "5411", "7802", "7995", "5944"
+        };
+        double[] merchantAvg = {
+            55.10, 302.78, 488.45, 140.00,
+            31.70, 74.25, 93.80, 45.55,
+            88.40, 120.10, 211.35, 285.70,
+            430.80, 150.00, 62.95, 240.20
+        };
+        boolean[] online = {
+            false, true, false, false,
+            true, true, true, false,
+            true, false, true, false,
+            false, true, true, true
+        };
+        boolean[] cardPresent = {
+            true, false, true, true,
+            false, false, false, true,
+            false, true, false, true,
+            true, false, false, false
+        };
+        double[] kmFromHome = {
+            2.7, 18.4, 47.6, 6.1,
+            920.3, 403.7, 281.4, 765.2,
+            612.8, 55.1, 288.9, 397.5,
+            22.0, 84.6, 948.4, 331.6
+        };
+        double[] kmFromCurrent = {
+            0.0, 8.2, 12.6, 19.7,
+            811.3, 452.9, 278.4, 923.6,
+            554.1, 31.5, 118.2, 260.4,
+            5.5, 74.0, 875.2, 210.9
+        };
 
         byte[][] out = new byte[TEMPLATE_COUNT][];
         int idx = 0;
         for (int t = 0; t < TEMPLATE_COUNT; t++) {
-            String mcc = mccs[t % mccs.length];
-            int inst = installments[t % installments.length];
-            int kmc = knownMerchantsCounts[t % knownMerchantsCounts.length];
-            boolean online = flags[t % 2];
-            boolean cardPresent = flags[(t / 2) % 2];
-            boolean hasLastTx = (t % 2) == 0;
-            double amount = 100.0 + t * 47.5;
-            double customerAvg = 200.0 + t * 31.0;
-            double merchantAvg = 150.0 + t * 23.0;
-            double kmFromHome = 1.0 + t * 4.7;
-            double kmFromCurrent = 0.5 + t * 3.3;
-            int tx24h = 1 + (t * 7) % 50;
-            int hour = (t * 5) % 24;
+            String knownMerchants = knownMerchantsJson(knownStart[t], knownCount[t]);
 
-            StringBuilder km = new StringBuilder("[");
-            for (int k = 0; k < kmc; k++) {
-                if (k > 0) km.append(',');
-                km.append("\"MERC-").append(String.format("%03d", k)).append('"');
-            }
-            km.append(']');
-
-            String body = String.format(
+            String body = String.format(Locale.ROOT,
                 "{\"id\":\"tx-warmup-%04d\","
-                + "\"transaction\":{\"amount\":%.2f,\"installments\":%d,\"requested_at\":\"2026-01-15T%02d:23:35Z\"},"
+                + "\"transaction\":{\"amount\":%.2f,\"installments\":%d,\"requested_at\":\"%s\"},"
                 + "\"customer\":{\"avg_amount\":%.2f,\"tx_count_24h\":%d,\"known_merchants\":%s},"
-                + "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"%s\",\"avg_amount\":%.2f},"
+                + "\"merchant\":{\"id\":\"%s\",\"mcc\":\"%s\",\"avg_amount\":%.2f},"
                 + "\"terminal\":{\"is_online\":%b,\"card_present\":%b,\"km_from_home\":%.4f},"
                 + "\"last_transaction\":%s}",
-                t, amount, inst, hour,
-                customerAvg, tx24h, km.toString(),
-                mcc, merchantAvg,
-                online, cardPresent, kmFromHome,
-                hasLastTx
-                    ? String.format("{\"timestamp\":\"2026-01-15T%02d:58:35Z\",\"km_from_current\":%.4f}", (hour + 23) % 24, kmFromCurrent)
-                    : "null"
+                t, amount[t], installments[t], requestedAt[t],
+                customerAvg[t], tx24h[t], knownMerchants,
+                merchantId[t], mccs[t], merchantAvg[t],
+                online[t], cardPresent[t], kmFromHome[t],
+                lastAt[t] == null
+                    ? "null"
+                    : String.format(Locale.ROOT,
+                        "{\"timestamp\":\"%s\",\"km_from_current\":%.4f}",
+                        lastAt[t], kmFromCurrent[t])
             );
             out[idx++] = body.getBytes(StandardCharsets.UTF_8);
         }
         return out;
+    }
+
+    private static String knownMerchantsJson(int start, int count) {
+        StringBuilder km = new StringBuilder("[");
+        for (int k = 0; k < count; k++) {
+            if (k > 0) km.append(',');
+            km.append("\"MERC-").append(String.format(Locale.ROOT, "%03d", ((start + k - 1) % 19) + 1)).append('"');
+        }
+        km.append(']');
+        return km.toString();
     }
 
     /** DCE-defeat sink — warmup loops XOR result lanes here so the JIT can't elide calls. */

@@ -23,7 +23,13 @@ final class HttpConnection {
     static final int TOO_LARGE = 3;
 
     static final int READ_BUF_SIZE = 4096;
-    static final int WRITE_BUF_SIZE = 4096;
+
+    /**
+     * Maximum responses queued into the gathering-write pipeline before forcing a flush.
+     * With a 4 KB readBuf and ~60 B minimal POST + 110 B response, max realistic pipelining
+     * is well under 16. The hard cap also bounds the per-conn ByteBuffer[] memory.
+     */
+    static final int MAX_PIPELINE_SLOTS = 16;
 
     // Lowercase: callers OR each input byte with 0x20, idempotent on '-', ':', and lowercase ASCII.
     private static final byte[] CONTENT_LENGTH_LC = "content-length:".getBytes(StandardCharsets.US_ASCII);
@@ -37,19 +43,14 @@ final class HttpConnection {
     private static final long HIGH_BITS = 0x8080808080808080L;
 
     final ByteBuffer readBuf = ByteBuffer.allocate(READ_BUF_SIZE);
-    // Direct write buffer avoids the JDK's per-write heap-to-native staging copy on SocketChannel.write().
-    // Responses are tiny but p99 is hypersensitive to extra memcpy/JNI staging on the single IO thread.
-    final ByteBuffer writeBuf = initWriteBuf();
 
-    private static ByteBuffer initWriteBuf() {
-        ByteBuffer b = ByteBuffer.allocateDirect(WRITE_BUF_SIZE);
-        // Touch the page immediately so the OS backs it now rather than on the first
-        // channel.write() call per connection. allocateDirect maps anonymous pages that
-        // are copy-on-write zero; without this touch the first write causes a minor page
-        // fault on the hot IO thread.
-        b.put(0, (byte) 0);
-        return b;
-    }
+    /**
+     * Gathering-write pipeline. Hot path queues per-write ByteBuffer slices (duplicates of the
+     * shared direct response buffers in ResponseEncoder) and a single GatheringByteChannel.write
+     * sends all of them with no intermediate memcpy.
+     */
+    final ByteBuffer[] pipeline = new ByteBuffer[MAX_PIPELINE_SLOTS];
+    int pipelineCount = 0;
 
     int routeId = Router.ROUTE_NOT_FOUND;
     int bodyStart = -1;

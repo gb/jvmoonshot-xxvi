@@ -6,10 +6,9 @@ import java.lang.foreign.MemorySegment;
 import java.lang.reflect.Field;
 
 /**
- * Raw Unsafe read for {@link KdTree}'s packed-nav reads from mmap'd pts.
- * leftAndDim is packed as two consecutive i16 shorts at pts byte-offset
- * {@code (treeIdx*STRIDE + LANE_LEFT_DIM)*2}. Reading a LE int32 at that offset
- * reconstructs leftAndDim directly (same byte order).
+ * Raw Unsafe read for {@link KdTree}'s mmap'd pts. The packed nav word is stored as two
+ * consecutive i16 shorts at byte-offset {@code (treeIdx*STRIDE + LANE_NAV)*2}; reading
+ * a LE int32 at that offset reconstructs it directly.
  *
  * <p>Software prefetch ({@code PREFETCHT0}) was investigated via {@code jdk.internal.misc.Unsafe.prefetchRead0}
  * but that method was removed in JDK 25. JNI/Panama downcall alternatives are not C2-intrinsified,

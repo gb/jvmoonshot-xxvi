@@ -2,7 +2,6 @@ package com.github.gb.moonshot.http;
 
 import java.io.IOException;
 import java.net.StandardProtocolFamily;
-import java.net.StandardSocketOptions;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -107,7 +106,8 @@ public final class FdReceiver {
             try {
                 ch = FdConnHandler.wrapFd(rawFd);
                 ch.configureBlocking(false);
-                ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
+                // TCP_NODELAY is set in lapada before sendmsg(SCM_RIGHTS) — saves one
+                // setsockopt syscall on this CPU-budgeted thread per accepted fd.
                 nioServer.injectChannel(ch);
             } catch (Throwable t) {
                 if (ch != null) {

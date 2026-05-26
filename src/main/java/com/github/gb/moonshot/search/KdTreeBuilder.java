@@ -6,7 +6,7 @@ import java.util.Arrays;
 import java.util.Random;
 
 import static com.github.gb.moonshot.search.KdTree.*;
-import static com.github.gb.moonshot.search.KdTreeLayout.packLeftAndDim;
+import static com.github.gb.moonshot.search.KdTreeLayout.packNav;
 import static com.github.gb.moonshot.search.KdTreeLayout.unpackLeft;
 
 /**
@@ -29,14 +29,14 @@ public final class KdTreeBuilder {
         boolean[] srcFraud = dataset.fraudLabels();
 
         // Float source in permuted order (for split decisions).
-        // srcVecsFloat/srcVecsShort use STRIDE (=20) so split code reads them with the same
+        // srcVecsFloat/srcVecsShort use STRIDE so split code reads them with the same
         // stride as it reads pts[].  dataset.vectors() uses Dataset.STRIDE (=16): use
         // separate source and dest bases to avoid the mismatch.
         float[] srcVecsFloat = new float[nodeCount * STRIDE];
         short[] srcVecsShort = new short[nodeCount * STRIDE];
         for (int i = 0; i < nodeCount; i++) {
             int srcBase = i * KdTreeLayout.STRIDE; // Dataset uses STRIDE=16 (f32 layout)
-            int dstBase = i * STRIDE;         // our arrays use STRIDE=20
+            int dstBase = i * STRIDE;
             for (int d = 0; d < DIMS; d++) {
                 float v = srcVecsSemantic[srcBase + dimPerm[d]];
                 srcVecsFloat[dstBase + d] = v;
@@ -77,19 +77,17 @@ public final class KdTreeBuilder {
     /**
      * Compute bbox bounds recursively. {@code out[0..DIMS-1]} = lo, {@code out[DIMS..2*DIMS-1]} = hi.
      * Stores into {@code tmpBbox} in STRIDE_BBOX layout: lo at [0..13], hi at [16..29]; pads stay 0.
-     * right index is read from pts[LANE_RIGHT..LANE_RIGHT+1] (STRIDE=20 layout).
+     * right index and fraud flag are read from the packed nav word at pts[LANE_NAV..LANE_NAV+1].
      */
     private static void computeTopBboxesRec(
             short[] pts, int treeIdx, int depth,
             int[] topSlot, short[] tmpBbox, int[] nextSlot, short[] out
     ) {
         int ptsOffset = treeIdx * STRIDE;
-        int leftAndDim = (pts[ptsOffset + LANE_LEFT_DIM] & 0xFFFF)
-                | ((pts[ptsOffset + LANE_LEFT_DIM + 1] & 0xFFFF) << 16);
-        int leftIdx = unpackLeft(leftAndDim);
-        // right is now packed in pts[LANE_RIGHT..LANE_RIGHT+1]
-        int rightIdx = (pts[ptsOffset + LANE_RIGHT] & 0xFFFF)
-                | ((pts[ptsOffset + LANE_RIGHT + 1] & 0xFFFF) << 16);
+        int nav = (pts[ptsOffset + LANE_NAV] & 0xFFFF)
+                | ((pts[ptsOffset + LANE_NAV + 1] & 0xFFFF) << 16);
+        int leftIdx = unpackLeft(treeIdx, nav);
+        int rightIdx = KdTreeLayout.unpackRight(nav);
 
         for (int d = 0; d < DIMS; d++) {
             short v = pts[ptsOffset + d];
@@ -142,22 +140,23 @@ public final class KdTreeBuilder {
         origId[treeIdx] = srcId;
         byte fraudBit = (byte) (srcFraud[srcId] ? 1 : 0);
         fraud[treeIdx] = fraudBit;
-        // Pack fraud flag into lane LANE_FRAUD (18) of the pts short array (was unused padding).
-        // In mmap mode this eliminates the separate 3 MB on-heap fraud[] array.
-        pts[treeIdx * STRIDE + LANE_FRAUD] = fraudBit;
 
         int leftIdx = buildRecursive(srcVecsFloat, srcVecsShort, srcFraud, indices,
                 from, splitPos, depth + 1, pts, origId, fraud, nextIdx, rng);
         int rightIdx = buildRecursive(srcVecsFloat, srcVecsShort, srcFraud, indices,
                 splitPos + 1, to, depth + 1, pts, origId, fraud, nextIdx, rng);
 
-        // Pack leftAndDim into pts shorts[14..15].
-        int packed = packLeftAndDim(leftIdx, splitDim);
-        pts[treeIdx * STRIDE + LANE_LEFT_DIM] = (short) (packed & 0xFFFF);
-        pts[treeIdx * STRIDE + LANE_LEFT_DIM + 1] = (short) ((packed >>> 16) & 0xFFFF);
-        // Pack right into pts shorts[16..17].
-        pts[treeIdx * STRIDE + LANE_RIGHT] = (short) (rightIdx & 0xFFFF);
-        pts[treeIdx * STRIDE + LANE_RIGHT + 1] = (short) ((rightIdx >>> 16) & 0xFFFF);
+        boolean hasLeft = leftIdx >= 0;
+        if (hasLeft && leftIdx != treeIdx + 1) {
+            throw new IllegalStateException("preorder left child invariant broken");
+        }
+        // hasBbox iff depth ≤ TOP_BBOX_DEPTH (matches computeTopBboxesRec slot-assignment guard).
+        // childrenHaveBbox iff depth < TOP_BBOX_DEPTH (children at depth+1 still have valid slots).
+        boolean hasBbox = depth <= TOP_BBOX_DEPTH;
+        boolean childrenHaveBbox = depth < TOP_BBOX_DEPTH;
+        int packed = packNav(rightIdx, splitDim, fraudBit != 0, hasLeft, hasBbox, childrenHaveBbox);
+        pts[treeIdx * STRIDE + LANE_NAV] = (short) (packed & 0xFFFF);
+        pts[treeIdx * STRIDE + LANE_NAV + 1] = (short) ((packed >>> 16) & 0xFFFF);
 
         return treeIdx;
     }

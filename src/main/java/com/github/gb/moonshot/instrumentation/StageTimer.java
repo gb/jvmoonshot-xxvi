@@ -52,6 +52,7 @@ public final class StageTimer {
     }
     private static final long[] BUF = new long[N * STAGES];
     private static final int[]  VISITS = new int[N];
+    private static final int[]  BBOX_CHECKS = new int[N];
     private static int idx;
     private static int dumpCount;
 
@@ -74,9 +75,14 @@ public final class StageTimer {
     }
 
     public static void recordVisits(int n) {
+        recordSearchWork(n, -1);
+    }
+
+    public static void recordSearchWork(int visits, int bboxChecks) {
         if (!ENABLED) return;
         if (idx >= N) return;
-        VISITS[idx] = n;
+        VISITS[idx] = visits;
+        BBOX_CHECKS[idx] = bboxChecks;
     }
 
     public static void complete() {
@@ -99,7 +105,7 @@ public final class StageTimer {
 
         long[] tmp = new long[N];
         printStagePercentiles(tmp);
-        printVisitPercentiles();
+        printSearchWorkPercentiles();
         printLatencyVisitCorrelation();
     }
 
@@ -118,7 +124,7 @@ public final class StageTimer {
         }
     }
 
-    private static void printVisitPercentiles() {
+    private static void printSearchWorkPercentiles() {
         int[] visitsSorted = VISITS.clone();
         Arrays.sort(visitsSorted);
         System.out.printf(PERCENTILE_INT_FMT,
@@ -129,6 +135,29 @@ public final class StageTimer {
             quantileInt(visitsSorted, PERCENTILES[3]),
             quantileInt(visitsSorted, PERCENTILES[4]),
             visitsSorted[N - 1]);
+        int[] bboxSorted = BBOX_CHECKS.clone();
+        Arrays.sort(bboxSorted);
+        if (bboxSorted[N - 1] >= 0) {
+            System.out.printf(PERCENTILE_INT_FMT,
+                "bbox",
+                quantileInt(bboxSorted, PERCENTILES[0]),
+                quantileInt(bboxSorted, PERCENTILES[1]),
+                quantileInt(bboxSorted, PERCENTILES[2]),
+                quantileInt(bboxSorted, PERCENTILES[3]),
+                quantileInt(bboxSorted, PERCENTILES[4]),
+                bboxSorted[N - 1]);
+            int[] work = new int[N];
+            for (int i = 0; i < N; i++) work[i] = VISITS[i] + BBOX_CHECKS[i];
+            Arrays.sort(work);
+            System.out.printf(PERCENTILE_INT_FMT,
+                "work",
+                quantileInt(work, PERCENTILES[0]),
+                quantileInt(work, PERCENTILES[1]),
+                quantileInt(work, PERCENTILES[2]),
+                quantileInt(work, PERCENTILES[3]),
+                quantileInt(work, PERCENTILES[4]),
+                work[N - 1]);
+        }
     }
 
     /**

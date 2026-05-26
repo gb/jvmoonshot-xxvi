@@ -1,9 +1,9 @@
 # Stages: build (jar + kdtree-i16.bin) -> aot record -> aot create -> runtime.
 
 # JVM_HEAP must be byte-identical in record/create/runtime: the AOT cache is
-# keyed on these flags. UnlockDiagnosticVMOptions is required for
-# GuaranteedSafepointInterval (diagnostic flag).
-ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=48m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:+UseFMA -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-BackgroundCompilation -XX:-UsePerfData -XX:+DisableExplicitGC"
+# keyed on these flags. Keep the safepoint/pre-touch/THP flags: dropping them
+# looked fine locally but produced >500ms p99 on contest hardware.
+ARG JVM_HEAP="-Xms65m -Xmx65m -Xss256k -XX:MaxMetaspaceSize=64m -XX:ReservedCodeCacheSize=48m -XX:ActiveProcessorCount=1 -XX:CICompilerCount=2 -XX:+UseFMA -XX:MaxInlineLevel=20 -XX:MaxInlineSize=500 -XX:+AlwaysPreTouch -XX:+UseTransparentHugePages -XX:+UnlockDiagnosticVMOptions -XX:GuaranteedSafepointInterval=0 -XX:-UsePerfData -XX:-BackgroundCompilation -XX:+DisableExplicitGC"
 
 FROM maven:3.9-eclipse-temurin-25 AS build
 WORKDIR /src
@@ -43,10 +43,16 @@ ENV JVM_HEAP="${JVM_HEAP}" \
     PORT=8080 \
     INDEX_KIND=kdtree-i16 \
     KDTREE_GRAPH=/data/kdtree-i16.bin \
-    KDTREE_RELAX_SOFT_CAP=900 \
-    KDTREE_RELAX_RANGE=700 \
-    KDTREE_RELAX_EPSILON=0 \
-    FRAUD_CACHE_BITS=0
+    KDTREE_EARLY_DIST_MILLI=110 \
+    KDTREE_REFINE_BOUNDARY=1 \
+    KDTREE_PRIME_PLUNGE_CAP=1 \
+    KDTREE_RELAX_SOFT_CAP=700 \
+    KDTREE_RELAX_RANGE=900 \
+    KDTREE_RELAX_EPSILON=0.025 \
+    KDTREE_BUCKET_LEAF_DEPTH=18 \
+    KDTREE_BUCKET_LEAF_MAX_NODES=64 \
+    KDTREE_PROFILING=0 \
+    STAGE_TIMING=0
 
 # AOT_TRAINING=1 makes MoonShot.main exit after the live listener and FD-passing
 # pumps so the JVM records the same hot paths production uses behind lapada.
@@ -54,10 +60,16 @@ RUN mkdir -p /tmp/moonshot-aot \
  && LISTEN_SOCKET=/tmp/moonshot-aot/api.sock \
     FD_SOCKET=/tmp/moonshot-aot/api-fd.sock \
     AOT_TRAINING=1 \
-    KDTREE_RELAX_SOFT_CAP=900 \
-    KDTREE_RELAX_RANGE=700 \
-    KDTREE_RELAX_EPSILON=0 \
-    FRAUD_CACHE_BITS=0 \
+    KDTREE_EARLY_DIST_MILLI=110 \
+    KDTREE_REFINE_BOUNDARY=1 \
+    KDTREE_PRIME_PLUNGE_CAP=1 \
+    KDTREE_RELAX_SOFT_CAP=700 \
+    KDTREE_RELAX_RANGE=900 \
+    KDTREE_RELAX_EPSILON=0.025 \
+    KDTREE_BUCKET_LEAF_DEPTH=18 \
+    KDTREE_BUCKET_LEAF_MAX_NODES=64 \
+    KDTREE_PROFILING=0 \
+    STAGE_TIMING=0 \
     java $JVM_HEAP -XX:+UseSerialGC \
         --add-modules jdk.incubator.vector \
         --enable-native-access=ALL-UNNAMED \
@@ -80,6 +92,7 @@ RUN java $JVM_HEAP -XX:+UseSerialGC \
 # AOT requires JDK, so yeah, not a mistake. Use the glibc image because
 # FdPassing's Linux x86-64 control-message layout is intentionally glibc-shaped.
 FROM eclipse-temurin:25-jdk
+RUN apt-get update && apt-get install -y libjemalloc2 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app/app.jar          /app/app.jar
 COPY --from=build /data/kdtree-i16.bin  /data/kdtree-i16.bin
@@ -89,14 +102,21 @@ COPY --from=build /tmp/app.aot          /app/app.aot
 ENV PORT=8080 \
     INDEX_KIND=kdtree-i16 \
     KDTREE_GRAPH=/data/kdtree-i16.bin \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
     MALLOC_ARENA_MAX=1 \
-    KDTREE_RELAX_SOFT_CAP=900 \
-    KDTREE_RELAX_RANGE=700 \
-    KDTREE_RELAX_EPSILON=0 \
-    FRAUD_CACHE_BITS=0
+    KDTREE_EARLY_DIST_MILLI=110 \
+    KDTREE_REFINE_BOUNDARY=1 \
+    KDTREE_PRIME_PLUNGE_CAP=1 \
+    KDTREE_RELAX_SOFT_CAP=700 \
+    KDTREE_RELAX_RANGE=900 \
+    KDTREE_RELAX_EPSILON=0.025 \
+    KDTREE_BUCKET_LEAF_DEPTH=18 \
+    KDTREE_BUCKET_LEAF_MAX_NODES=64 \
+    KDTREE_PROFILING=0 \
+    STAGE_TIMING=0
 
 EXPOSE 8080
 
 ARG JVM_HEAP
 ENV JVM_HEAP="${JVM_HEAP}"
-ENTRYPOINT ["sh", "-c", "exec java $JVM_HEAP -XX:+UseSerialGC --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED -XX:AOTCache=/app/app.aot ${JIT_LOG:+-XX:+LogCompilation -XX:LogFile=/tmp/jit.log} -jar /app/app.jar"]
+ENTRYPOINT ["sh", "-c", "exec java $JVM_HEAP -XX:+UseSerialGC --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED -XX:AOTCache=/app/app.aot ${JIT_LOG:+-XX:+LogCompilation -XX:LogFile=/tmp/jit.log} ${GC_LOG:+-Xlog:gc*=info:/tmp/gc.log} -jar /app/app.jar"]
