@@ -1,12 +1,13 @@
 services:
   lb:
-    image: ghcr.io/gb/lapada:1.1-NG
+    image: ghcr.io/gb/lapada:1.3-NG
     platform: linux/amd64
     container_name: rinha-lb
     ports:
       - "9999:9999"
     environment:
       FD_UPSTREAMS: "/sockets/api1-fd.sock,/sockets/api2-fd.sock"
+      LAPADA_READY_FILE: /sockets/lapada.ready
     volumes:
       - sockets:/sockets
     depends_on:
@@ -14,6 +15,13 @@ services:
         condition: service_healthy
       api2:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/lapada", "--healthcheck"]
+      interval: 60s
+      timeout: 1s
+      retries: 120
+      start_period: 60s
+      start_interval: 1s
     ulimits:
       nofile:
         soft: 65535
@@ -27,19 +35,21 @@ services:
           memory: "10M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.2-NG
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.1-NG
     platform: linux/amd64
     container_name: rinha-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
       READY_FILE: /sockets/api1.ready
-      KDTREE_EARLY_DIST_MILLI: "161"
+      KDTREE_EARLY_DIST_MILLI: "110"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
-      KDTREE_RELAX_SOFT_CAP: "900"
-      KDTREE_RELAX_RANGE: "700"
+      KDTREE_RELAX_SOFT_CAP: "700"
+      KDTREE_RELAX_RANGE: "900"
       KDTREE_RELAX_EPSILON: "0.025"
+      KDTREE_BUCKET_LEAF_DEPTH: "18"
+      KDTREE_BUCKET_LEAF_MAX_NODES: "64"
     volumes:
       - sockets:/sockets
     healthcheck:
@@ -53,6 +63,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     mem_limit: "167m"
     memswap_limit: "167m"
     deploy:
@@ -62,19 +75,21 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.2-NG
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.1-NG
     platform: linux/amd64
     container_name: rinha-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
       READY_FILE: /sockets/api2.ready
-      KDTREE_EARLY_DIST_MILLI: "161"
+      KDTREE_EARLY_DIST_MILLI: "110"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
-      KDTREE_RELAX_SOFT_CAP: "900"
-      KDTREE_RELAX_RANGE: "700"
+      KDTREE_RELAX_SOFT_CAP: "700"
+      KDTREE_RELAX_RANGE: "900"
       KDTREE_RELAX_EPSILON: "0.025"
+      KDTREE_BUCKET_LEAF_DEPTH: "18"
+      KDTREE_BUCKET_LEAF_MAX_NODES: "64"
     volumes:
       - sockets:/sockets
     healthcheck:
@@ -88,6 +103,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     mem_limit: "167m"
     memswap_limit: "167m"
     deploy:
