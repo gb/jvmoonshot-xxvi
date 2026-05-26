@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/gb/lapada:1.3-NG
+    image: ghcr.io/gb/lapada:1.3.1-NG
     platform: linux/amd64
     container_name: rinha-lb
     ports:
@@ -35,14 +35,14 @@ services:
           memory: "10M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.1-NG
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.2-NG
     platform: linux/amd64
     container_name: rinha-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
       READY_FILE: /sockets/api1.ready
-      KDTREE_EARLY_DIST_MILLI: "110"
+      KDTREE_EARLY_DIST_MILLI: "160"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
       KDTREE_RELAX_SOFT_CAP: "700"
@@ -75,14 +75,14 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.1-NG
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.2-NG
     platform: linux/amd64
     container_name: rinha-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
       READY_FILE: /sockets/api2.ready
-      KDTREE_EARLY_DIST_MILLI: "110"
+      KDTREE_EARLY_DIST_MILLI: "160"
       KDTREE_REFINE_BOUNDARY: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
       KDTREE_RELAX_SOFT_CAP: "700"
