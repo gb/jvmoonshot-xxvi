@@ -1,0 +1,28 @@
+[package]
+name = "lapada"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Purpose-built TCP/UDS round-robin LB for Rinha de Backend 2026."
+
+[dependencies]
+# Minimal tokio surface: current-thread runtime, TCP/UDS sockets, copy helpers,
+# #[tokio::main] macro, and tokio::time::timeout. Everything else (signals,
+# multi-thread runtime, fs, process) is excluded by default-features=false.
+tokio = { version = "1.40", default-features = false, features = ["rt", "net", "io-util", "macros", "time", "sync"] }
+
+# libc is needed only for setsockopt(TCP_QUICKACK) on Linux; not pulled in on
+# macOS dev builds where the option doesn't exist anyway.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = 3
