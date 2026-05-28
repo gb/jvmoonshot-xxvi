@@ -35,19 +35,20 @@ services:
           memory: "10M"
 
   api1:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.4-NG
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.5-NG
     platform: linux/amd64
     container_name: rinha-api1
     environment:
       LISTEN_SOCKET: /sockets/api1.sock
       FD_SOCKET: /sockets/api1-fd.sock
       READY_FILE: /sockets/api1.ready
-      KDTREE_EARLY_DIST_MILLI: "160"
+      KDTREE_EARLY_DIST_MILLI: "161"
       KDTREE_REFINE_BOUNDARY: "1"
+      KDTREE_REFINE_PRESEED: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
-      KDTREE_RELAX_SOFT_CAP: "700"
-      KDTREE_RELAX_RANGE: "900"
-      KDTREE_RELAX_EPSILON: "0.025"
+      KDTREE_RELAX_SOFT_CAP: "750"
+      KDTREE_RELAX_RANGE: "750"
+      KDTREE_RELAX_EPSILON: "0.030"
       KDTREE_BUCKET_LEAF_DEPTH: "18"
       KDTREE_BUCKET_LEAF_MAX_NODES: "64"
     volumes:
@@ -75,19 +76,20 @@ services:
           memory: "167M"
 
   api2:
-    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.4-NG
+    image: ghcr.io/gb/jvmoonshot-xxvi:1.3.5-NG
     platform: linux/amd64
     container_name: rinha-api2
     environment:
       LISTEN_SOCKET: /sockets/api2.sock
       FD_SOCKET: /sockets/api2-fd.sock
       READY_FILE: /sockets/api2.ready
-      KDTREE_EARLY_DIST_MILLI: "160"
+      KDTREE_EARLY_DIST_MILLI: "161"
       KDTREE_REFINE_BOUNDARY: "1"
+      KDTREE_REFINE_PRESEED: "1"
       KDTREE_PRIME_PLUNGE_CAP: "1"
-      KDTREE_RELAX_SOFT_CAP: "700"
-      KDTREE_RELAX_RANGE: "900"
-      KDTREE_RELAX_EPSILON: "0.025"
+      KDTREE_RELAX_SOFT_CAP: "750"
+      KDTREE_RELAX_RANGE: "750"
+      KDTREE_RELAX_EPSILON: "0.030"
       KDTREE_BUCKET_LEAF_DEPTH: "18"
       KDTREE_BUCKET_LEAF_MAX_NODES: "64"
     volumes:
